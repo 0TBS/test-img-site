@@ -1267,16 +1267,20 @@
 
     var others = checked.filter(function (info) { return info !== reference; });
     // Anything the audit called "bad" that is not about identity: a file can be
-    // the right bytes and still be served in a way that breaks it.
-    var served = checked.filter(function (info) {
+    // the right bytes and still be served in a way that breaks it. Counted over
+    // the copies alone — a headline about "the copy" must not be triggered by a
+    // fault on the original, which is a different sentence entirely.
+    var misserved = function (info) {
       return info.ok && info.flags.some(function (f) { return f.level === 'bad'; });
-    });
+    };
+    var served = others.filter(misserved);
+    var originalMisserved = reference && misserved(reference);
 
     var headline;
     if (!reference || !reference.ok) {
       headline = 'The original could not be read.';
     } else if (!others.length) {
-      headline = served.length
+      headline = originalMisserved
         ? 'The file is there, but not being served properly.'
         : 'One host checked — nothing to compare it against.';
     } else {
@@ -1320,6 +1324,15 @@
       }
     }
     box.appendChild(el('p', 'verdict-headline', headline));
+
+    // The original is a host too, and it can be the one that is broken. Said
+    // separately, because "the copy is not being served properly" would be the
+    // wrong host and the opposite of what the notes below show.
+    if (originalMisserved && others.length) {
+      box.appendChild(el('p', 'verdict-caveat',
+        'The original itself is not being served properly — see ' + reference.record.name + ' below. '
+        + 'That is a fault on the host you are moving away from, not on the copies.'));
+    }
 
     var detail = el('p', 'verdict-detail');
     detail.textContent = reference

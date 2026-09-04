@@ -76,7 +76,8 @@
         <label class="field-label" for="runs">Runs per host</label>
         <input type="number" id="runs" min="1" max="40" step="1" value="8" aria-describedby="runs-hint">
         <span class="field-hint" id="runs-hint">The order is reshuffled every run, so a passing wobble
-          in your connection cannot keep landing on the same host.</span>
+          in your connection is unlikely to keep landing on the same host. More runs make that
+          less likely still, and give the significance test something to work with.</span>
       </div>
 
       <div class="field field-check">
