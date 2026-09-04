@@ -16,8 +16,9 @@ tools/make-samples.py regenerates the sample images
 
 ## What it actually measures
 
-- Each host gets the same number of runs, and the hosts **alternate turns** so a slow patch in the
-  network does not land consistently on one side.
+- Each host gets the same number of runs, and the order is **shuffled every run** so a slow patch in
+  the network cannot land on the same host each time. Strict alternation can align with a periodic
+  disturbance; a fresh order cannot.
 - Requests are **sequential**, never parallel — two images racing for the same bandwidth measure the
   bandwidth, not the hosts.
 - Two modes, because they answer different questions. **Repeat visitor** (the default) uses stable
@@ -72,13 +73,15 @@ The Backblaze side is pre-filled too. The same three sample files live in a publ
 `us-east-005`, under a `speed-test/` prefix:
 
 ```
-https://f005.backblazeb2.com/file/brandingcentres-imgsite-test/speed-test/
+https://brandingcentres-imgsite-test.s3.us-east-005.backblazeb2.com/speed-test/
 ```
 
 That is the bucket endpoint with nothing in front of it, which is deliberate — it is the honest
-"object storage, one region, no CDN" baseline. Two things to expect from it: B2 answers over
-**HTTP/1.1**, and it sends no `Timing-Allow-Origin`, so the page will report totals for this host and
-`not exposed` for the phase breakdown.
+"object storage, one region, no CDN" baseline. It is the **S3-style** address rather than the native
+`f005.backblazeb2.com/file/<bucket>/` one because B2 applies bucket CORS rules to the S3 endpoint,
+and without a permitted cross-origin read this host could only be measured by the cruder method.
+Two things to expect from it: B2 answers over **HTTP/1.1**, and it sends no `Timing-Allow-Origin`, so
+the page reports a total for this host and `not exposed` for the phase breakdown.
 
 The third card is the CDN comparison, and it is filled in too:
 
