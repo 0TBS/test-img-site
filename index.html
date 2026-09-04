@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitHub vs Backblaze — image speed test</title>
+<meta name="description" content="Load the same image from GitHub and from Backblaze B2, side by side, and measure which one gets to the browser first.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>⚡</text></svg>">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="masthead">
+  <div class="wrap">
+    <p class="eyebrow">Image hosting benchmark</p>
+    <h1>Does it matter where your images live?</h1>
+    <p class="lede">
+      This page loads the <strong>same image file</strong> from two or more hosts, one request at a
+      time, and times each one in your browser. Nothing is simulated and nothing is sent anywhere —
+      the measurements are the browser's own
+      <a href="https://developer.mozilla.org/en-US/docs/Web/API/PerformanceResourceTiming" target="_blank" rel="noopener">Resource Timing</a>
+      numbers, taken on your connection, from wherever you happen to be sitting.
+    </p>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- ─────────────────────────── setup ─────────────────────────── -->
+  <section class="panel" id="setup">
+    <div class="panel-head">
+      <h2>1. The contenders</h2>
+      <p class="panel-note">
+        Each host serves the same file name. Set a base URL per host — the payload picker below
+        appends the file name to it.
+      </p>
+    </div>
+    <div class="hosts" id="hosts"><!-- rendered by app.js --></div>
+  </section>
+
+  <section class="panel" id="controls-panel">
+    <div class="panel-head">
+      <h2>2. The test</h2>
+    </div>
+
+    <div class="controls">
+      <label class="field">
+        <span class="field-label">Payload</span>
+        <select id="payload"></select>
+        <span class="field-hint" id="payload-hint"></span>
+      </label>
+
+      <label class="field">
+        <span class="field-label">Runs per host</span>
+        <input type="number" id="runs" min="1" max="40" step="1" value="8">
+        <span class="field-hint">Hosts alternate turn by turn, so a passing wobble in your
+          connection hits both sides equally.</span>
+      </label>
+
+      <label class="field field-check">
+        <input type="checkbox" id="warmup" checked>
+        <span>
+          <span class="field-label">Warm the connection first</span>
+          <span class="field-hint">One untimed request per host, so DNS, TCP and TLS are already
+            paid for. Turn this off to measure a cold visitor's very first image instead.</span>
+        </span>
+      </label>
+
+      <div class="actions">
+        <button id="run" class="btn btn-primary" type="button">Run the test</button>
+        <button id="race" class="btn" type="button">Visual race</button>
+        <button id="reset" class="btn btn-quiet" type="button">Reset</button>
+      </div>
+    </div>
+
+    <p class="status" id="status" role="status" aria-live="polite"></p>
+    <div class="progress" id="progress" hidden><div class="progress-bar" id="progress-bar"></div></div>
+  </section>
+
+  <!-- ─────────────────────────── results ─────────────────────────── -->
+  <section class="panel" id="results" hidden>
+    <div class="panel-head">
+      <h2>3. The result</h2>
+    </div>
+
+    <div class="verdict" id="verdict"></div>
+
+    <h3 class="sub">Median time to a fully loaded image</h3>
+    <div class="bars" id="bars"></div>
+
+    <h3 class="sub">Where the time went</h3>
+    <p class="panel-note" id="phases-note"></p>
+    <div class="table-scroll">
+      <table class="grid" id="phases"></table>
+    </div>
+
+    <h3 class="sub">Run by run</h3>
+    <div class="chart-scroll">
+      <svg id="runchart" class="runchart" role="img" aria-label="Load time of each run, per host"></svg>
+    </div>
+    <div class="table-scroll">
+      <table class="grid" id="runs-table"></table>
+    </div>
+  </section>
+
+  <!-- ─────────────────────────── race ─────────────────────────── -->
+  <section class="panel" id="race-panel" hidden>
+    <div class="panel-head">
+      <h2>Visual race</h2>
+      <p class="panel-note">
+        Both requests fire at the same moment and share your bandwidth, so the times are slower than
+        the measured test above. This one is for watching, not for citing.
+      </p>
+    </div>
+    <div class="race" id="race-track"></div>
+  </section>
+
+  <!-- ─────────────────────────── reading ─────────────────────────── -->
+  <section class="panel prose">
+    <h2>How to read these numbers</h2>
+
+    <p>
+      A single run tells you very little. Networks are noisy, and the first request to a host pays
+      for a DNS lookup, a TCP handshake and a TLS negotiation that later requests reuse. That is why
+      this page runs several times, alternates between hosts, and reports the <strong>median</strong>
+      rather than the average — one unlucky run cannot drag the median around the way it drags a mean.
+    </p>
+
+    <p>
+      Every request carries a unique <code>?cb=</code> value, so nothing is answered from your browser
+      cache. That also means each request is a fresh miss at the CDN edge, which is the honest
+      comparison: it measures how quickly each host can produce a file it is not already holding
+      close to you. Real visitors will often do better than these numbers on a host with a CDN in
+      front of it, because the second visitor from their city gets a cached copy.
+    </p>
+
+    <h3>Why the two hosts are not really the same kind of thing</h3>
+    <ul>
+      <li>
+        <strong>raw.githubusercontent.com</strong> is a convenience endpoint for reading files out of
+        a repository. It is rate limited, it is not a CDN contract, and GitHub's terms do not cover
+        using it as a production asset host. It is a great "does this work" URL and a poor place to
+        point a live site.
+      </li>
+      <li>
+        <strong>GitHub Pages</strong> (<code>username.github.io</code>) is a real static host with a
+        CDN in front of it. If you want the GitHub side of this comparison to be a fair fight, this
+        is the URL to use, not the raw one.
+      </li>
+      <li>
+        <strong>Backblaze B2</strong> is object storage. Hitting the bucket endpoint directly
+        (<code>f00x.backblazeb2.com</code>) means going to one region every time, from anywhere in the
+        world. Putting Cloudflare in front of it — the <code>img.yourdomain.com</code> arrangement —
+        adds a cache at the edge and, through the Bandwidth Alliance, makes egress free. That is
+        where B2 starts to look good on both speed and the bill.
+      </li>
+    </ul>
+
+    <p>
+      So the interesting comparison is usually not "GitHub or Backblaze" but
+      <em>"is there a CDN in front of it, and how far is the origin from the visitor"</em>. Add all
+      three URLs above — raw GitHub, direct B2, and B2 behind Cloudflare — and the shape of the
+      answer usually appears in the first eight runs.
+    </p>
+
+    <h3>Things this page cannot see</h3>
+    <ul>
+      <li>
+        Cross-origin hosts only expose a phase-by-phase breakdown (DNS, connect, TLS, waiting,
+        downloading) if they send a <code>Timing-Allow-Origin</code> header. Where a host does not,
+        the table falls back to the total, and says so.
+      </li>
+      <li>
+        Transferred byte counts have the same restriction. If a size reads as unknown, check that the
+        two hosts really are serving the same file before trusting the comparison — one of them may
+        be re-encoding or resizing it.
+      </li>
+      <li>
+        Your result is your result: your city, your ISP, your Wi-Fi, this minute. It is evidence
+        about your visitors only to the extent that they sit where you sit.
+      </li>
+    </ul>
+  </section>
+</main>
+
+<footer class="wrap footer">
+  <p>Static page, no dependencies, no tracking. Every measurement stays in your browser.</p>
+</footer>
+
+<script src="assets/app.js"></script>
+</body>
+</html>
