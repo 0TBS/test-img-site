@@ -15,6 +15,10 @@
   // fork it; the payload file name is appended to whatever base you set.
   var GITHUB_RAW = 'https://raw.githubusercontent.com/0tbs/test-img-site/main/assets/';
 
+  // The bucket endpoint holding the same three sample files. Public, in the
+  // us-east-005 region.
+  var B2_DIRECT = 'https://f005.backblazeb2.com/file/brandingcentres-imgsite-test/speed-test/';
+
   var DEFAULT_HOSTS = [
     {
       id: 'github',
@@ -24,19 +28,18 @@
       enabled: true
     },
     {
-      id: 'backblaze',
-      name: 'Backblaze B2 behind Cloudflare',
-      blurb: 'The img.yourdomain.com arrangement: a B2 bucket with Cloudflare in front of it, so requests are answered from an edge cache and egress is free.',
-      base: '',
-      placeholder: 'https://img.yourdomain.com/',
+      id: 'b2direct',
+      name: 'Backblaze B2 (direct)',
+      blurb: 'The bucket endpoint with nothing in front of it: every request travels to the one region the bucket lives in, over HTTP/1.1, with no Timing-Allow-Origin header — so this host will only report totals.',
+      base: B2_DIRECT,
       enabled: true
     },
     {
-      id: 'b2direct',
-      name: 'Backblaze B2 (direct)',
-      blurb: 'The bucket endpoint with nothing in front of it. Every request travels to the one region the bucket lives in. Optional — useful for seeing what the CDN is actually buying you.',
+      id: 'backblaze',
+      name: 'Backblaze B2 behind Cloudflare',
+      blurb: 'The img.yourdomain.com arrangement: the same bucket with Cloudflare in front of it, so requests are answered from an edge cache and egress is free. Fill this in to see what the CDN is actually buying you.',
       base: '',
-      placeholder: 'https://f003.backblazeb2.com/file/your-bucket/',
+      placeholder: 'https://img.yourdomain.com/',
       enabled: false
     }
   ];

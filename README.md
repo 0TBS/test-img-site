@@ -50,17 +50,24 @@ https://raw.githubusercontent.com/0tbs/test-img-site/main/assets/
 That URL only answers once these files are on `main`. Testing from a branch before it is merged?
 Swap `main` for the branch name in the input — the page will remember it.
 
-For the Backblaze side, upload the three `assets/sample-*.jpg` files to a B2 bucket, keeping the file
-names, and paste the base URL into the second card. In the TBOX Studio stack that is the
-`img.<domain>` hostname created at gate 7 — a public B2 bucket with Cloudflare in front of it:
+The Backblaze side is pre-filled too. The same three sample files live in a public B2 bucket in
+`us-east-005`, under a `speed-test/` prefix:
 
 ```
-https://img.yourdomain.com/
+https://f005.backblazeb2.com/file/brandingcentres-imgsite-test/speed-test/
 ```
 
-The third card, off by default, is for the bucket's own endpoint
-(`https://f003.backblazeb2.com/file/your-bucket/`). Enabling it is the interesting part of the test:
-it separates *"B2 is fast"* from *"Cloudflare's edge cache is fast"*.
+That is the bucket endpoint with nothing in front of it, which is deliberate — it is the honest
+"object storage, one region, no CDN" baseline. Two things to expect from it: B2 answers over
+**HTTP/1.1**, and it sends no `Timing-Allow-Origin`, so the page will report totals for this host and
+`not exposed` for the phase breakdown.
+
+The third card, off by default, is where the CDN comparison happens: put an `img.<domain>` hostname
+in it — the same bucket with Cloudflare in front, which in the TBOX Studio stack is what gate 7
+creates — and the three-way result separates *"B2 is fast"* from *"Cloudflare's edge cache is fast"*.
+
+To re-upload the samples to a bucket of your own, keep the file names and set `image/jpeg` as the
+content type.
 
 Settings are remembered in `localStorage`, so a reload keeps your URLs.
 
