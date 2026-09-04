@@ -236,6 +236,7 @@ code {
 }
 .verdict-headline { margin: 0 0 6px; font-size: clamp(18px, 3vw, 22px); }
 .verdict-detail { margin: 0; color: var(--ink-2); font-size: 14.5px; }
+.verdict-detail + .verdict-detail { margin-top: 10px; }
 .verdict-caveat { margin: 10px 0 0; color: var(--warn); font-size: 13.5px; }
 
 /* ── bar chart ──────────────────────────────────────────────────────── */
@@ -337,3 +338,20 @@ code {
   .panel { padding: 18px 16px; }
   .masthead { padding: 40px 0 30px; }
 }
+
+/* ── limits disclosure ──────────────────────────────────────────────── */
+
+.limits {
+  margin-top: 14px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+.limits summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 640;
+  color: var(--ink-2);
+}
+.limits summary:hover { color: var(--ink); }
+.limits ul { margin: 10px 0 0; padding-left: 20px; }
+.limits li { color: var(--ink-2); font-size: 13.5px; margin-bottom: 8px; max-width: 70ch; }

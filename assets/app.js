@@ -61,6 +61,7 @@
   var FAILED_TIMEOUT_MS = 4000; // short leash once a host has already failed
   var GIVE_UP_AFTER = 2;        // consecutive failures before a host is dropped
   var GAP_MS = 120;             // breathing room so requests never overlap
+  var ENTRY_GRACE_MS = 250;     // how long to wait for a resource timing entry
 
   var MODES = [
     {
@@ -121,6 +122,14 @@
     var m = mean(list);
     var variance = list.reduce(function (acc, v) { return acc + (v - m) * (v - m); }, 0) / (list.length - 1);
     return Math.sqrt(variance);
+  }
+
+  function shuffle(list) {
+    for (var i = list.length - 1; i > 0; i--) {
+      var j = Math.floor(Math.random() * (i + 1));
+      var tmp = list[i]; list[i] = list[j]; list[j] = tmp;
+    }
+    return list;
   }
 
   function joinUrl(base, file) {
@@ -205,6 +214,66 @@
 
   // ── measurement ─────────────────────────────────────────────────────
 
+  // Resource timing entries arrive asynchronously. Polling for them after a
+  // setTimeout races the browser: sometimes the entry has landed, sometimes it
+  // has not and the run silently falls back to a wall-clock reading instead.
+  // Mixing two measurement sources across runs of the same host is exactly the
+  // kind of quiet inconsistency this test cannot afford, so entries are taken
+  // from an observer and claimed in order.
+  var pendingEntries = {};
+  var entryWaiters = {};
+  var observer = null;
+
+  function startObserver() {
+    if (typeof PerformanceObserver !== 'function') return false;
+    pendingEntries = {};
+    entryWaiters = {};
+    if (observer) observer.disconnect();
+    observer = new PerformanceObserver(function (list) {
+      list.getEntries().forEach(function (entry) {
+        if (entry.entryType !== 'resource') return;
+        var waiting = entryWaiters[entry.name];
+        if (waiting && waiting.length) { waiting.shift()(entry); return; }
+        (pendingEntries[entry.name] = pendingEntries[entry.name] || []).push(entry);
+      });
+    });
+    // buffered:false — only entries created from here on, so nothing the page
+    // loaded earlier can be mistaken for a measurement.
+    observer.observe({ type: 'resource', buffered: false });
+    return true;
+  }
+
+  function stopObserver() {
+    if (observer) { observer.disconnect(); observer = null; }
+  }
+
+  // Requests are strictly sequential, so the next entry under a given name is
+  // always this request's.
+  function awaitEntry(url, graceMs) {
+    return new Promise(function (resolve) {
+      var queued = pendingEntries[url];
+      if (queued && queued.length) return resolve(queued.shift());
+
+      var settled = false;
+      var waiters = entryWaiters[url] = entryWaiters[url] || [];
+      var claim = function (entry) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(entry);
+      };
+      waiters.push(claim);
+
+      var timer = setTimeout(function () {
+        if (settled) return;
+        settled = true;
+        var i = waiters.indexOf(claim);
+        if (i >= 0) waiters.splice(i, 1);
+        resolve(null);
+      }, graceMs);
+    });
+  }
+
   // Can this host be read cross-origin? Only then can a request be timed with
   // fetch, which is what makes warm-cache mode and exact byte counts possible.
   function probeCors(url) {
@@ -277,32 +346,42 @@
     });
   }
 
-  // The resource timing entry lands when the transfer completes, which can be
-  // a beat after the promise settles. Give the queue one turn before reading.
+  // The resource timing entry lands a beat after the transfer completes. Wait
+  // for the observer to hand it over rather than guessing when it is ready.
   function settle(url, ok, wall, measuredBytes, seen) {
+    if (observer) {
+      return awaitEntry(url, ENTRY_GRACE_MS).then(function (entry) {
+        return describe(url, ok, wall, measuredBytes, seen, entry);
+      });
+    }
     return new Promise(function (resolve) {
-      setTimeout(function () { resolve(describe(url, ok, wall, measuredBytes, seen)); }, 0);
+      setTimeout(function () { resolve(describe(url, ok, wall, measuredBytes, seen, null)); }, 0);
     });
   }
 
-  function describe(url, ok, wall, measuredBytes, seen) {
+  function describe(url, ok, wall, measuredBytes, seen, observed) {
     var result = {
       ok: ok,
       total: wall,
       detailed: false,
       dns: null, connect: null, tls: null, wait: null, download: null,
       bytes: measuredBytes,
-      measuredBytes: measuredBytes
+      measuredBytes: measuredBytes,
+      source: 'wallclock'
     };
     if (!ok) { result.total = null; return result; }
 
     // Only an entry recorded after this request started describes this
     // request. If none arrived, keep the wall-clock reading rather than
     // attributing an older entry to this run.
-    var entries = performance.getEntriesByName(url);
-    var entry = entries.length > seen ? entries[entries.length - 1] : null;
+    var entry = observed;
+    if (!entry) {
+      var entries = performance.getEntriesByName(url);
+      entry = entries.length > seen ? entries[entries.length - 1] : null;
+    }
     if (!entry) return result;
 
+    result.source = 'timing';
     result.total = entry.duration || wall;
 
     // Everything below responseEnd is zeroed for cross-origin responses that do
@@ -399,6 +478,7 @@
 
     if (performance.setResourceTimingBufferSize) performance.setResourceTimingBufferSize(1000);
     if (performance.clearResourceTimings) performance.clearResourceTimings();
+    startObserver();
 
     var results = hosts.map(function (host, index) {
       return {
@@ -453,10 +533,10 @@
     }
 
     for (var run = 0; run < state.runs; run++) {
-      // Alternate who goes first so a slow patch in the network does not
-      // consistently land on the same host.
-      var order = results.slice();
-      if (run % 2 === 1) order.reverse();
+      // Shuffle rather than alternate. Strict ABAB ordering can line up with a
+      // periodic disturbance — a background sync, a wifi beacon — and hand the
+      // same host the bad slot every time. A fresh order each run cannot.
+      var order = shuffle(results.slice());
 
       for (var i = 0; i < order.length; i++) {
         var target = order[i];
@@ -503,7 +583,12 @@
       // are only available to hosts that opt in. The distinction decides
       // whether the fairness check below can be trusted.
       r.bytesMeasured = r.samples.some(function (s) { return s.measuredBytes != null; });
+      // If some runs were timed from a resource entry and others from the wall
+      // clock, the numbers are not strictly comparable within the host.
+      r.wallclockRuns = r.samples.filter(function (s) { return s.source === 'wallclock'; }).length;
     });
+
+    stopObserver();
 
     lastResults = results;
     lastMeta = run_meta;
@@ -627,10 +712,41 @@
     if (state.runs < 5) {
       caveats.push('Fewer than five runs per host. That is enough for a rough look and not enough to trust.');
     }
+    var mixed = finished.filter(function (r) { return r.wallclockRuns > 0; });
+    if (mixed.length) {
+      caveats.push(mixed.map(function (r) {
+        return hostLabel(r.url) + ' had ' + r.wallclockRuns + ' of ' + r.stats.n
+          + ' runs timed by wall clock because no resource timing entry arrived';
+      }).join('; ') + '. Those readings include a little scheduling overhead the others do not.');
+    }
     if (winner.stats.stdev && winner.stats.stdev > winner.stats.median * 0.5) {
       caveats.push('The run-to-run spread is wider than half the median, so your connection was unsettled. Run it again before drawing a conclusion.');
     }
     caveats.forEach(function (text) { box.appendChild(el('p', 'verdict-caveat', text)); });
+
+    box.appendChild(renderLimits(meta, finished));
+  }
+
+  // Shown on every result, pass or fail. A benchmark that does not state its
+  // own scope invites being read as more than it is.
+  function renderLimits(meta, finished) {
+    var wrap = el('details', 'limits');
+    var summary = el('summary', null, 'What this result does and does not establish');
+    wrap.appendChild(summary);
+
+    var list = el('ul');
+    [
+      'It measures your connection, from where you are, right now. It is evidence about your visitors only in so far as they sit where you sit and connect as you connect. A host that wins here can lose from another continent.',
+      'It measures ' + (meta.mode === 'warm'
+        ? 'the repeat-visitor path, with any CDN edge warm. A first visitor to a cold edge will see slower numbers than these.'
+        : 'the first-visitor path, with every cache missed. Ordinary visitors to a host with a CDN will see faster numbers than these.'),
+      'It compares ' + finished.length + ' host' + (finished.length === 1 ? '' : 's') + ' on one file of one size. Ranking can and does change with payload size — try the other sizes before concluding anything.',
+      'Timings come from the browser, which deliberately coarsens its clocks. Differences of a millisecond or two are below the noise floor and should be read as "the same".',
+      'A single run of this page is one sample of a noisy process. Agreement across several runs at different times of day is worth far more than one decisive-looking result.'
+    ].forEach(function (text) { list.appendChild(el('li', null, text)); });
+
+    wrap.appendChild(list);
+    return wrap;
   }
 
   function renderBars(results) {
