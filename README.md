@@ -69,11 +69,19 @@ What it catches, in rough order of how often it actually happens:
 Every URL is requested with a cache-busting token, so the report describes what the host is holding
 now rather than what an edge cached before you replaced the file.
 
-The check is deliberately quiet about things it cannot see. Only a handful of response headers are
-readable cross-origin without the host opting in — `Content-Type`, `Content-Length`,
-`Cache-Control`, `Expires`, `Last-Modified` — so those are reported directly. Anything else, such as
-`cf-cache-status` or `etag`, needs the host to name it in `Access-Control-Expose-Headers`, and reads
-as missing otherwise rather than being reported as absent.
+The check is deliberately quiet about things it cannot see. A browser exposes only a handful of
+response headers cross-origin without the host opting in, and the two the report uses —
+`Content-Type` and `Cache-Control` — are among them; the size is counted from the body rather than
+read from a header at all. Anything else, `cf-cache-status` for instance, needs the host to name it
+in `Access-Control-Expose-Headers`, and is simply absent from the report otherwise rather than being
+declared missing.
+
+A host that refuses the cross-origin read outright has no readable headers at all, and the report
+says **not readable** for every one of them rather than **none**. That distinction is the whole
+point: a bucket serving a perfect year-long `Cache-Control` that this page cannot see must not be
+reported as having none. For the same reason a 403 says the object may well be there and the bucket
+may simply not be public, rather than claiming the file is missing — and the all-clear at the top is
+printed only when every copy was actually read and matched, never merely because nothing complained.
 
 Nothing here can list what is *in* a bucket. Public object storage serves an object you name but
 will not enumerate its contents to an anonymous browser — a `ListObjectsV2` against a public
