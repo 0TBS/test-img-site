@@ -62,9 +62,20 @@ That is the bucket endpoint with nothing in front of it, which is deliberate —
 **HTTP/1.1**, and it sends no `Timing-Allow-Origin`, so the page will report totals for this host and
 `not exposed` for the phase breakdown.
 
-The third card, off by default, is where the CDN comparison happens: put an `img.<domain>` hostname
-in it — the same bucket with Cloudflare in front, which in the TBOX Studio stack is what gate 7
-creates — and the three-way result separates *"B2 is fast"* from *"Cloudflare's edge cache is fast"*.
+The third card is the CDN comparison, and it is filled in too:
+
+```
+https://imgtest.crystic.ca/speed-test/
+```
+
+That is the **same bucket, same region, same files**, reached through a small Cloudflare worker that
+rewrites the path onto the bucket and caches at the edge for 24 hours — the arrangement the TBOX
+Studio stack builds at gate 7. Because the worker owns the response, it can add the
+`Timing-Allow-Origin` header that B2 cannot send itself, which makes this the one host in the test
+that reports a full phase breakdown rather than just a total.
+
+The gap between card two and card three is the whole point: it separates *"B2 is fast"* from
+*"Cloudflare's edge cache is fast"*.
 
 To re-upload the samples to a bucket of your own, keep the file names and set `image/jpeg` as the
 content type.

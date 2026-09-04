@@ -19,6 +19,10 @@
   // us-east-005 region.
   var B2_DIRECT = 'https://f005.backblazeb2.com/file/brandingcentres-imgsite-test/speed-test/';
 
+  // The same bucket reached through Cloudflare: a worker rewrites the path and
+  // caches at the edge for 24 hours. This is the arrangement worth copying.
+  var B2_CLOUDFLARE = 'https://imgtest.crystic.ca/speed-test/';
+
   var DEFAULT_HOSTS = [
     {
       id: 'github',
@@ -37,10 +41,9 @@
     {
       id: 'backblaze',
       name: 'Backblaze B2 behind Cloudflare',
-      blurb: 'The img.yourdomain.com arrangement: the same bucket with Cloudflare in front of it, so requests are answered from an edge cache and egress is free. Fill this in to see what the CDN is actually buying you.',
-      base: '',
-      placeholder: 'https://img.yourdomain.com/',
-      enabled: false
+      blurb: 'The same bucket, same region, same files — reached through a Cloudflare worker that caches at the edge. HTTP/2, and it adds the Timing-Allow-Origin header that B2 cannot send itself, so this is the one host here that will show you where the time actually went.',
+      base: B2_CLOUDFLARE,
+      enabled: true
     }
   ];
 
