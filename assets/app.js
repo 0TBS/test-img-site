@@ -130,10 +130,21 @@
     warmup: true
   };
 
+  function defaultBaseFor(id) {
+    var host = DEFAULT_HOSTS.filter(function (h) { return h.id === id; })[0];
+    return host ? host.base : '';
+  }
+
   function save() {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({
-        hosts: state.hosts.map(function (h) { return { id: h.id, base: h.base, enabled: h.enabled }; }),
+        // defaultBase records what the page shipped at the time this was
+        // written. If a later version ships a different URL, that new default
+        // wins on the next visit — otherwise a remembered blank would shadow
+        // it forever and the host would silently never run.
+        hosts: state.hosts.map(function (h) {
+          return { id: h.id, base: h.base, enabled: h.enabled, defaultBase: defaultBaseFor(h.id) };
+        }),
         payload: state.payload,
         runs: state.runs,
         warmup: state.warmup
@@ -153,6 +164,10 @@
       saved.hosts.forEach(function (entry) {
         var host = state.hosts.filter(function (h) { return h.id === entry.id; })[0];
         if (!host) return;
+        // Written by a version that shipped a different URL for this host (or
+        // by one that recorded no default at all). Keep the current default
+        // rather than restoring a value chosen against an older one.
+        if (entry.defaultBase !== defaultBaseFor(entry.id)) return;
         if (typeof entry.base === 'string') host.base = entry.base;
         if (typeof entry.enabled === 'boolean') host.enabled = entry.enabled;
       });
