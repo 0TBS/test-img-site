@@ -62,6 +62,7 @@
   var GIVE_UP_AFTER = 2;        // consecutive failures before a host is dropped
   var GAP_MS = 120;             // breathing room so requests never overlap
   var ENTRY_GRACE_MS = 250;     // how long to wait for a resource timing entry
+  var PROBE_ATTEMPTS = 3;       // a dropped probe must not demote the method
 
   var MODES = [
     {
@@ -276,10 +277,19 @@
 
   // Can this host be read cross-origin? Only then can a request be timed with
   // fetch, which is what makes warm-cache mode and exact byte counts possible.
-  function probeCors(url) {
+  function probeCors(url, attempt) {
     return fetch(bust(url), { mode: 'cors', cache: 'no-store' })
-      .then(function (response) { return response.ok; })
-      .catch(function () { return false; });
+      // Any response at all means the cross-origin read was permitted. The
+      // status is irrelevant here: a 503 still proves the browser was allowed
+      // to see the response, and treating it as a refusal would demote every
+      // host to the cruder method over one transient blip.
+      .then(function () { return true; })
+      .catch(function () {
+        // A rejection is either a genuine CORS refusal or a dropped request,
+        // and they are indistinguishable from here. Retry before concluding.
+        if ((attempt || 0) >= PROBE_ATTEMPTS - 1) return false;
+        return sleep(GAP_MS).then(function () { return probeCors(url, (attempt || 0) + 1); });
+      });
   }
 
   // Time one request. Two methods, and every host in a run uses the same one:

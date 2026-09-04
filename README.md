@@ -35,6 +35,11 @@ tools/make-samples.py regenerates the sample images
 - The headline number is the **median**, not the mean, so one unlucky run cannot move it far, and a
   **Mann–Whitney U test** decides whether the gap survives the run-to-run noise. If it does not, the
   verdict says *Too close to call* instead of naming a winner.
+- A **failed request is never a sample.** Any non-2xx is discarded, which matters because errors
+  arrive fast: counting one 503 as a success would drag a median toward zero and invent a winner.
+- The cross-origin capability probe **retries** and treats *any* response as permission, including a
+  5xx. A single transient error must not demote every host to the cruder method — B2 does return the
+  occasional 503, so this is a real case rather than a theoretical one.
 - Each request reads **its own** resource-timing entry. Repeat-visitor mode reuses one URL per host,
   so entries accumulate under a single name; the page records how many existed before a request and
   ignores anything older, rather than re-reporting the previous run's number.
