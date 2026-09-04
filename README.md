@@ -84,6 +84,13 @@ already there so `assets/` is served untouched.
 **Cloudflare Workers** — the repo is a plain static directory; point Workers Builds at it with no
 build command and `.` as the asset directory.
 
+**Railway** — the `Dockerfile` and `Caddyfile` in the root are all it needs: Railway detects the
+Dockerfile, builds a Caddy image with the site copied into `/srv`, and serves it on `$PORT`. There is
+no build step. Caddy is configured to send `Timing-Allow-Origin: *` and `Access-Control-Allow-Origin:
+*`, so a copy of the page running anywhere else can read this host's full phase breakdown and byte
+counts rather than only its totals — which makes the Railway deployment usable as a fourth contender
+in the test, not just a place to read the page.
+
 ## Regenerating the samples
 
 The sample images are synthetic: gradients, blurred blobs, fine arcs and per-pixel grain, so JPEG
