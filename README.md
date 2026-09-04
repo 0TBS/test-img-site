@@ -68,11 +68,21 @@ The third card is the CDN comparison, and it is filled in too:
 https://imgtest.crystic.ca/speed-test/
 ```
 
-That is the **same bucket, same region, same files**, reached through a small Cloudflare worker that
-rewrites the path onto the bucket and caches at the edge for 24 hours — the arrangement the TBOX
-Studio stack builds at gate 7. Because the worker owns the response, it can add the
-`Timing-Allow-Origin` header that B2 cannot send itself, which makes this the one host in the test
-that reports a full phase breakdown rather than just a total.
+That is the **same bucket, same region, same files**, reached through Cloudflare — the arrangement
+the TBOX Studio stack builds at gate 7. Three pieces, no worker:
+
+1. A **proxied CNAME**, `imgtest` → `f005.backblazeb2.com`. On its own this cannot work: B2's native
+   URL is `/file/<bucket>/<key>`, and a request arriving as `/speed-test/sample.jpg` names no bucket.
+2. A **URL-rewrite transform rule**, scoped to `http.host eq "imgtest.crystic.ca"`, rewriting the
+   path to `concat("/file/brandingcentres-imgsite-test", http.request.uri.path)`. This is the piece
+   that makes the CNAME mean anything.
+3. A **response-header transform rule** on the same expression, setting `Timing-Allow-Origin: *` and
+   `Access-Control-Allow-Origin: *` — headers B2 cannot send itself. This is what makes this the one
+   host in the test that reports a full phase breakdown rather than just a total.
+
+Both rules are scoped by hostname, so they cannot affect anything else on the zone. Edge caching
+needs no configuration: `.jpg` is cached by default and the objects carry a long immutable
+`Cache-Control` set at upload.
 
 The gap between card two and card three is the whole point: it separates *"B2 is fast"* from
 *"Cloudflare's edge cache is fast"*.
