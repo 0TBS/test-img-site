@@ -51,14 +51,14 @@
     {
       id: 'b2direct',
       name: 'Backblaze B2 (direct)',
-      blurb: 'The bucket endpoint with nothing in front of it: every request travels to the one region the bucket lives in, over HTTP/1.1. It sends no Timing-Allow-Origin, so it reports a total but no phase breakdown.',
+      blurb: 'The bucket endpoint with nothing in front of it: every request travels to the one region the bucket lives in. It sends no Timing-Allow-Origin, so it reports a total, and its phase breakdown and its protocol both read as not exposed.',
       base: B2_DIRECT,
       enabled: true
     },
     {
       id: 'backblaze',
       name: 'Backblaze B2 behind Cloudflare',
-      blurb: 'The same bucket, same region, same files — reached through Cloudflare, which answers from an edge cache. HTTP/2, and a response-header rule adds the Timing-Allow-Origin that B2 cannot send itself, so this is the one host here that will show you where the time actually went.',
+      blurb: 'The same bucket, same region, same files — reached through Cloudflare, which answers from an edge cache. A response-header rule adds the Timing-Allow-Origin that B2 cannot send itself, so this is the one host here that will show you where the time actually went, and over which protocol.',
       base: B2_CLOUDFLARE,
       enabled: true
     }
@@ -71,7 +71,7 @@
     {
       id: 'cloudflare',
       name: 'Bucket behind Cloudflare',
-      blurb: 'A bucket served through one of your own Cloudflare DNS records — the img.<domain> arrangement: a proxied CNAME, a URL-rewrite rule that prepends the bucket to the path, and a response-header rule adding Timing-Allow-Origin.',
+      blurb: 'A bucket served through one of your own Cloudflare DNS records — the img.<domain> arrangement: a proxied CNAME, a URL-rewrite rule that prepends the bucket to the path, and a response-header rule adding both Access-Control-Allow-Origin and Timing-Allow-Origin.',
       placeholder: 'https://img.yourdomain.com/'
     },
     {
@@ -211,7 +211,14 @@
     try {
       path = new URL(base).pathname;
     } catch (err) {
-      path = String(base).replace(/^[a-z][a-z0-9+.\-]*:\/\/[^/]*/i, '').split(/[?#]/)[0];
+      // No scheme, so nothing has been parsed off the front. Everything before
+      // the first slash is an authority, not a path — without this, a hostname
+      // pasted out of a DNS dashboard (img.example.com) would look like a file
+      // because of its dots, and every request would go to this page's origin.
+      var raw = String(base).replace(/^\/\//, '');
+      var slash = raw.indexOf('/');
+      if (slash < 0) return false;
+      path = raw.slice(slash).split(/[?#]/)[0];
     }
     var last = path.split('/').pop();
     return last.indexOf('.') > 0;
@@ -225,7 +232,13 @@
     if (!trimmed) return '';
     if (looksLikeFile(trimmed)) return trimmed;
     if (!file) return '';
-    return trimmed.replace(/\/+$/, '') + '/' + String(file).replace(/^\/+/, '');
+    // Append to the path, not to the end of the string. A base carrying a
+    // query string or a fragment — a versioned or signed bucket prefix — would
+    // otherwise fold the file name into the query and request the directory.
+    var cut = trimmed.search(/[?#]/);
+    var path = cut < 0 ? trimmed : trimmed.slice(0, cut);
+    var suffix = cut < 0 ? '' : trimmed.slice(cut);
+    return path.replace(/\/+$/, '') + '/' + String(file).replace(/^\/+/, '') + suffix;
   }
 
   function bust(url) {
@@ -954,6 +967,7 @@
       status: null,
       error: null,
       corsBlocked: false,
+      decodeFailed: false,
       type: null,
       cacheControl: null,
       edge: null,
@@ -1014,7 +1028,11 @@
             info.ok = true;
             info.error = null;
           } else if (!info.error) {
-            info.error = 'unreachable';
+            // The <img> failing is not proof the file is missing: the browser
+            // may simply have no decoder for the format, or the decode may have
+            // run out of time. That distinction is carried into the report.
+            info.decodeFailed = true;
+            info.error = 'not readable';
           }
         });
       })
@@ -1032,15 +1050,52 @@
       });
   }
 
+  // A status code is not a diagnosis. 404 means the path is wrong; 403 usually
+  // means the object is there and the bucket is not public, which is the single
+  // most common thing to get wrong at this step and the one a blanket "the file
+  // is not there" would send somebody hunting for the wrong mistake.
+  function failureText(info) {
+    if (info.corsBlocked) {
+      return info.decodeFailed
+        ? 'The cross-origin read was refused and the browser could not decode it as an image either, so this cannot tell a missing file from a format it has no decoder for.'
+        : 'Nothing loaded from this URL at all — wrong path, wrong bucket, or the host is down.';
+    }
+    var status = info.status;
+    if (status === 404 || status === 410) return 'The host answered ' + status + '. Nothing is at that path.';
+    if (status === 401 || status === 403) return 'The host answered ' + status + '. The object may well be there — this is what a bucket that has not been made public says, and what a URL that needs signing says.';
+    if (status === 429) return 'The host answered 429: rate limited. Nothing is wrong with the file; there were too many requests.';
+    if (status >= 500) return 'The host answered ' + status + '. The host failed, which says nothing about whether the file is there.';
+    return 'The host answered ' + (info.error || 'with an error') + '.';
+  }
+
+  // Cache-Control is a list of directives, and reading it with one regex gets
+  // the common CDN arrangements wrong: no-cache means revalidate, not "do not
+  // store", and s-maxage is the one that governs the edge.
+  function readCache(value) {
+    var directives = String(value || '').toLowerCase().split(',').map(function (d) { return d.trim(); });
+    var seconds = function (name) {
+      var hit = directives.filter(function (d) { return d.indexOf(name + '=') === 0; })[0];
+      if (!hit) return null;
+      var n = Number(hit.slice(name.length + 1).replace(/"/g, ''));
+      return isFinite(n) ? n : null;
+    };
+    return {
+      present: !!String(value || '').trim(),
+      noStore: directives.indexOf('no-store') >= 0,
+      noCache: directives.indexOf('no-cache') >= 0,
+      immutable: directives.indexOf('immutable') >= 0,
+      maxAge: seconds('max-age'),
+      sMaxAge: seconds('s-maxage')
+    };
+  }
+
   // What is wrong with this copy, in the order a person would want to hear it.
   function auditCopy(info, reference) {
     var flags = [];
     var isReference = info === reference;
 
     if (!info.ok) {
-      flags.push({ level: 'bad', text: info.corsBlocked
-        ? 'Nothing loaded from this URL at all — wrong path, wrong bucket, or the host is down.'
-        : 'The host answered ' + (info.error || 'with an error') + '. The file is not there.' });
+      flags.push({ level: 'bad', text: failureText(info) });
       return flags;
     }
 
@@ -1056,9 +1111,22 @@
       flags.push({ level: 'bad', text: 'The file is empty — nought bytes. The upload created the object but never wrote to it.' });
     }
 
-    if (!isReference && reference && reference.ok) {
+    if (info.duplicateOf) {
+      flags.push({ level: 'warn', text: 'This card resolves to the same URL as ' + info.duplicateOf
+        + ', so it is the same object asked twice, not a copy to compare. Anything below about identity is trivially true.' });
+    }
+
+    if (!isReference && (!reference || !reference.ok)) {
+      // Nothing was compared. Saying so is the difference between a check that
+      // did not run and a copy that passed one.
+      flags.push({ level: 'warn', text: 'The original could not be read, so this copy was not compared against anything. Only how it is served was checked.' });
+    }
+
+    if (!isReference && reference && reference.ok && !info.duplicateOf) {
       if (info.buffer && reference.buffer) {
-        if (sameBytes(info.buffer, reference.buffer)) {
+        if (info.bytes === 0 && reference.bytes === 0) {
+          flags.push({ level: 'bad', text: 'Both this copy and the original are empty. Two files of nothing are not a verified move.' });
+        } else if (sameBytes(info.buffer, reference.buffer)) {
           flags.push({ level: 'good', text: 'Byte-for-byte identical to the original.' });
         } else if (info.bytes != null && reference.bytes != null && info.bytes !== reference.bytes) {
           var delta = info.bytes - reference.bytes;
@@ -1082,8 +1150,14 @@
     }
 
     if (info.corsBlocked) {
-      flags.push({ level: 'warn', text: 'Refuses cross-origin reads, so scripts on your site cannot fetch it and this page cannot verify its bytes. On a Cloudflare-fronted bucket that means the Access-Control-Allow-Origin response-header rule is missing or scoped to a different hostname.' });
-    } else if (!info.tao) {
+      // Everything below this line is read from response headers, and a refused
+      // cross-origin read means there were none to read. Reporting them as
+      // absent would be inventing a finding out of our own blindness.
+      flags.push({ level: 'warn', text: 'Refuses cross-origin reads, so scripts on your site cannot fetch it, this page cannot verify its bytes, and none of its headers can be inspected. On a Cloudflare-fronted bucket that means the Access-Control-Allow-Origin response-header rule is missing or scoped to a different hostname.' });
+      return flags;
+    }
+
+    if (!info.tao) {
       flags.push({ level: 'warn', text: 'No Timing-Allow-Origin header, so neither this page nor your own monitoring can see where the time goes on this host — only the total.' });
     }
 
@@ -1095,14 +1169,17 @@
         + ', so it is not caching this at the edge at all — every request travels to the bucket. That is the CDN in front of it doing nothing.' });
     }
 
-    var cache = String(info.cacheControl || '');
-    var maxAge = /max-age=(\d+)/i.exec(cache);
-    if (!cache) {
+    var cache = readCache(info.cacheControl);
+    var shared = cache.sMaxAge != null ? cache.sMaxAge : cache.maxAge;
+    if (!cache.present) {
       flags.push({ level: 'warn', text: 'No Cache-Control header. Every visitor, and every CDN edge, has to guess how long to keep it — usually meaning they re-fetch it far too often.' });
-    } else if (/no-store|no-cache/i.test(cache)) {
-      flags.push({ level: 'warn', text: 'Cache-Control says ' + cache + ', so nothing may cache it. For an image that never changes, that is throwing the CDN away.' });
-    } else if (maxAge && Number(maxAge[1]) < 86400) {
-      flags.push({ level: 'warn', text: 'Cache-Control keeps it for only ' + maxAge[1] + ' seconds. Images that never change are normally set to a year and marked immutable.' });
+    } else if (cache.noStore) {
+      flags.push({ level: 'warn', text: 'Cache-Control says no-store, so nothing may keep a copy of it at all. For an image that never changes, that is throwing the CDN away.' });
+    } else if (cache.noCache && cache.sMaxAge == null) {
+      flags.push({ level: 'warn', text: 'Cache-Control says no-cache, so every use has to be revalidated with the origin before the cached copy may be shown. For an image that never changes that is a round trip per visitor, per image.' });
+    } else if (shared != null && shared < 86400 && !cache.immutable) {
+      flags.push({ level: 'warn', text: 'Cache-Control keeps it for only ' + shared + ' second' + (shared === 1 ? '' : 's')
+        + '. Images that never change are normally set to a year and marked immutable.' });
     }
 
     if (!flags.length) flags.push({ level: 'good', text: 'Nothing to report.' });
@@ -1145,6 +1222,14 @@
     stopObserver();
 
     var referenceInfo = checked.filter(function (info) { return info.isReference; })[0] || checked[0];
+    // A card pointing at the same URL as another is one object asked twice.
+    // Comparing it against itself would produce the strongest claim this tool
+    // can make about a move that never happened.
+    checked.forEach(function (info) {
+      if (info === referenceInfo) return;
+      var twin = checked.filter(function (other) { return other !== info && other.url === info.url; })[0];
+      if (twin) info.duplicateOf = twin.record.name;
+    });
     checked.forEach(function (info) { info.flags = auditCopy(info, referenceInfo); });
 
     busy(false);
@@ -1153,6 +1238,25 @@
     setStatus('Move check done — ' + checked.length + ' host' + (checked.length === 1 ? '' : 's') + ' inspected.');
     renderMoveReport(checked, referenceInfo, markedMissing);
     $('move-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  // A row's first cell names what every other cell in it describes, which makes
+  // it a header, not data — the difference between a screen reader announcing
+  // "Size, 50 KB" and "img.example.com, Size, 50 KB" in an eight-column table.
+  function columnHeader(label) {
+    var cell = el('th', null, label);
+    cell.setAttribute('scope', 'col');
+    return cell;
+  }
+
+  function rowHeader(name) {
+    var cellHeader = el('th');
+    cellHeader.setAttribute('scope', 'row');
+    var cell = el('span', 'host-cell');
+    cell.appendChild(el('span', 'dot'));
+    cell.appendChild(document.createTextNode(name));
+    cellHeader.appendChild(cell);
+    return cellHeader;
   }
 
   function renderMoveReport(checked, reference, markedMissing) {
@@ -1176,30 +1280,43 @@
         ? 'The file is there, but not being served properly.'
         : 'One host checked — nothing to compare it against.';
     } else {
-      var identical = others.filter(function (info) {
-        return info.buffer && reference.buffer && sameBytes(info.buffer, reference.buffer);
+      // Three outcomes, not two. A copy nobody could read is not a copy that
+      // failed the comparison, and lumping the two together would report a
+      // CORS-refusing host as a corrupted file.
+      var comparable = others.filter(function (info) {
+        return info.ok && info.buffer && reference.buffer && !info.duplicateOf;
+      });
+      var identical = comparable.filter(function (info) {
+        return sameBytes(info.buffer, reference.buffer);
       }).length;
+      var unverified = others.filter(function (info) { return info.ok && comparable.indexOf(info) < 0; }).length;
       var broken = others.filter(function (info) { return !info.ok; }).length;
-      if (broken) {
-        headline = broken === others.length
-          ? (broken === 1 ? 'The copy did not load at all.' : 'None of the copies loaded at all.')
-          : broken + ' of ' + others.length + ' copies did not load at all.';
-      } else if (identical === others.length) {
+      var trailer = unverified
+        ? ' ' + unverified + (unverified === 1 ? ' copy could' : ' copies could') + ' not be compared at all.'
+        : '';
+
+      if (broken === others.length) {
+        headline = broken === 1 ? 'The copy did not load at all.' : 'None of the copies loaded at all.';
+      } else if (broken) {
+        headline = broken + ' of ' + others.length + ' copies did not load at all.';
+      } else if (!comparable.length) {
+        headline = 'Nothing could be compared.';
+      } else if (identical < comparable.length) {
+        headline = identical
+          ? identical + ' of ' + comparable.length + ' comparable copies match the original byte for byte.' + trailer
+          : (comparable.length === 1 ? 'The copy is not the same file as the original.' : 'No comparable copy matches the original.') + trailer;
+      } else if (served.length) {
         // The bytes matching is not the same as the move having worked. Saying
         // "identical" over the top of a wrong content type would be the exact
         // false all-clear this check exists to prevent.
-        headline = served.length
-          ? (others.length === 1
-              ? 'The bytes match, but the copy is not being served properly.'
-              : 'The bytes all match, but ' + served.length + ' host'
-                + (served.length === 1 ? ' is' : 's are') + ' not serving them properly.')
-          : (others.length === 1
-              ? 'The copy is byte-for-byte identical to the original.'
-              : 'All ' + others.length + ' copies are byte-for-byte identical to the original.');
-      } else if (identical) {
-        headline = identical + ' of ' + others.length + ' copies match the original byte for byte.';
+        headline = (comparable.length === 1
+          ? 'The bytes match, but the copy is not being served properly.'
+          : 'The bytes all match, but ' + served.length + ' host'
+            + (served.length === 1 ? ' is' : 's are') + ' not serving them properly.') + trailer;
       } else {
-        headline = 'No copy could be proved identical to the original.';
+        headline = (comparable.length === 1
+          ? 'The copy is byte-for-byte identical to the original.'
+          : 'All ' + comparable.length + ' comparable copies are byte-for-byte identical to the original.') + trailer;
       }
     }
     box.appendChild(el('p', 'verdict-headline', headline));
@@ -1217,12 +1334,22 @@
         + reference.record.name + ' stood in for it.'));
     }
 
-    var worst = checked.some(function (info) {
+    // The all-clear needs positive proof, not the absence of a complaint. A run
+    // in which nothing could be read produces no bad flags either, and telling
+    // somebody to proceed on that basis is the worst thing this page could do.
+    var proved = others.length && reference && reference.ok && others.every(function (info) {
+      return info.ok && !info.duplicateOf && info.buffer && reference.buffer
+        && sameBytes(info.buffer, reference.buffer);
+    });
+    var anyBad = checked.some(function (info) {
       return info.flags.some(function (f) { return f.level === 'bad'; });
     });
-    if (!worst && checked.length > 1) {
+    if (proved && !anyBad) {
       box.appendChild(el('p', 'verdict-detail',
-        'Nothing here blocks the move. Run the speed test next to see whether the new host is actually quicker.'));
+        'Every copy was read and matched. Nothing here blocks the move — run the speed test next to see whether the new host is actually quicker.'));
+    } else if (!anyBad && others.length) {
+      box.appendChild(el('p', 'verdict-detail',
+        'Nothing is obviously broken, but not everything could be verified. Read the host-by-host notes below before treating this as a clean move.'));
     }
 
     var table = $('move-table');
@@ -1231,7 +1358,7 @@
     var head = el('thead');
     var headRow = el('tr');
     ['Host', 'Result', 'Type', 'Size', 'Pixels', 'Cache-Control', 'Protocol', 'Digest'].forEach(function (label) {
-      headRow.appendChild(el('th', null, label));
+      headRow.appendChild(columnHeader(label));
     });
     head.appendChild(headRow);
     table.appendChild(head);
@@ -1241,19 +1368,20 @@
       var row = el('tr');
       row.style.setProperty('--host', info.record.colour);
 
-      var nameCell = el('td');
-      var cell = el('span', 'host-cell');
-      cell.appendChild(el('span', 'dot'));
-      cell.appendChild(document.createTextNode(info.record.name));
-      nameCell.appendChild(cell);
+      var nameCell = rowHeader(info.record.name);
       row.appendChild(nameCell);
 
       var verdictCell = el('td');
       var badge;
       if (!info.ok) {
         badge = el('span', 'badge bad', info.error || 'failed');
-      } else if (info.isReference) {
+      } else if (info === reference) {
+        // Identity, not the flag: where the marked card is missing from the run
+        // another one stands in for it, and that row is the reference here even
+        // though nobody marked it.
         badge = el('span', 'badge', 'reference');
+      } else if (info.duplicateOf) {
+        badge = el('span', 'badge warn', 'same URL');
       } else if (info.buffer && reference && reference.buffer) {
         badge = sameBytes(info.buffer, reference.buffer)
           ? el('span', 'badge good', 'identical')
@@ -1264,10 +1392,17 @@
       verdictCell.appendChild(badge);
       row.appendChild(verdictCell);
 
-      row.appendChild(el('td', info.type ? null : 'miss', info.type ? info.type.split(';')[0] : 'unknown'));
-      row.appendChild(el('td', info.bytes ? null : 'miss', info.bytes ? bytes(info.bytes) : 'not readable'));
+      // A refused cross-origin read leaves every header unreadable. "None" would
+      // be a measurement; these cells have to say they never saw one.
+      var unread = info.corsBlocked;
+      row.appendChild(el('td', info.type ? null : 'miss',
+        info.type ? info.type.split(';')[0] : (unread ? 'not readable' : 'unknown')));
+      // Not a truthiness test: nought bytes is a reading, and an important one.
+      row.appendChild(el('td', info.bytes == null ? 'miss' : null,
+        info.bytes == null ? 'not readable' : (info.bytes === 0 ? '0 B' : bytes(info.bytes))));
       row.appendChild(el('td', info.width ? null : 'miss', info.width ? info.width + ' × ' + info.height : 'not decoded'));
-      row.appendChild(el('td', 'wrap-cell' + (info.cacheControl ? '' : ' miss'), info.cacheControl || 'none'));
+      row.appendChild(el('td', 'wrap-cell' + (info.cacheControl ? '' : ' miss'),
+        info.cacheControl || (unread ? 'not readable' : 'none')));
       row.appendChild(el('td', info.protocol ? null : 'miss', info.protocol || 'not exposed'));
       row.appendChild(el('td', info.digest ? 'digest' : 'miss',
         info.digest ? info.digest.hex.slice(0, 12) : 'not readable'));
@@ -1299,9 +1434,24 @@
     });
 
     var digests = checked.filter(function (info) { return info.digest; });
-    $('move-digest-note').textContent = digests.length
-      ? 'Digests are ' + digests[0].digest.algo + ', truncated for display. Identity above is decided by comparing the bytes themselves, not by the digest.'
-      : 'No digests: the bytes of these hosts could not be read by script, so identity could not be proved.';
+    var algos = [];
+    digests.forEach(function (info) {
+      if (algos.indexOf(info.digest.algo) < 0) algos.push(info.digest.algo);
+    });
+    var note;
+    if (!digests.length) {
+      note = 'No digests: the bytes of these hosts could not be read by script, so identity could not be proved.';
+    } else {
+      note = 'Digests are ' + algos.join(' and ')
+        + (algos.indexOf('SHA-256') >= 0 ? ', shown as their first twelve characters' : '') + '. ';
+      note += 'Identity above is decided by comparing the bytes themselves, never by the digest.';
+      if (algos.indexOf('FNV-1a') >= 0) {
+        // Only reachable outside a secure context, where crypto.subtle does not
+        // exist. Worth showing, not worth recording as a fingerprint.
+        note += ' FNV-1a is the fallback where the browser offers no SHA-256 — this page is not on https or localhost. It is a 32-bit checksum, useful for spotting a change and no use at all as a fingerprint.';
+      }
+    }
+    $('move-digest-note').textContent = note;
   }
 
   // ── rendering: results ──────────────────────────────────────────────
@@ -1417,12 +1567,20 @@
       box.appendChild(solo);
       box.appendChild(renderHow(meta));
 
+      // Per host, not per run. meta.method is a whole-run decision: one other
+      // host refusing drags everybody down to <img>, and reporting that as this
+      // host's refusal would send somebody to fix a rule that is already right.
+      var refused = meta.blockedBy.indexOf(hostLabel(only.url)) >= 0;
       var exposure = el('p', 'verdict-detail');
       exposure.textContent = hostLabel(only.url) + ' '
-        + (meta.method === 'fetch' ? 'permits cross-origin reads' : 'refuses cross-origin reads')
+        + (refused ? 'refuses cross-origin reads' : 'permits cross-origin reads')
         + ' and ' + (only.detailed ? 'sends Timing-Allow-Origin, so the phase breakdown below is real'
           : 'sends no Timing-Allow-Origin, so only the total is visible')
         + (only.protocol ? '. It answered over ' + only.protocol + '.' : '.');
+      if (!refused && meta.method === 'image') {
+        exposure.textContent += ' The run still fell back to image loads, because '
+          + meta.blockedBy.join(' and ') + ' refused — so the breakdown above is what that fallback could see, not this host\'s limit.';
+      }
       box.appendChild(exposure);
 
       if (results.length > 1) {
@@ -1552,14 +1710,14 @@
 
     var anyDetail = results.some(function (r) { return r.detailed; });
     $('phases-note').textContent = (anyDetail
-      ? 'Median of each phase. A host only reveals this breakdown if it sends a Timing-Allow-Origin header; where it does not, only the total is available.'
+      ? 'Median of each phase. A host only reveals this breakdown, and the protocol it answered over, if it sends a Timing-Allow-Origin header; where it does not, only the total is available.'
       : 'None of these hosts sends a Timing-Allow-Origin header, so the browser will only tell us the totals. The breakdown below is unavailable — not zero.')
-      + ' Sizes marked as measured were counted from the response body, so they prove the hosts served the same file.';
+      + ' Sizes are counted from the response body wherever a cross-origin read was permitted, and inferred from the timing entry otherwise. Matching sizes are consistent with the same file; the move check is what proves it.';
 
     var head = el('thead');
     var headRow = el('tr');
     ['Host', 'DNS', 'Connect + TLS', 'Waiting', 'Downloading', 'Total', 'Size', 'Protocol'].forEach(function (label) {
-      headRow.appendChild(el('th', null, label));
+      headRow.appendChild(columnHeader(label));
     });
     head.appendChild(headRow);
     table.appendChild(head);
@@ -1569,12 +1727,7 @@
       var row = el('tr');
       row.style.setProperty('--host', r.colour);
 
-      var nameCell = el('td');
-      var cell = el('span', 'host-cell');
-      cell.appendChild(el('span', 'dot'));
-      cell.appendChild(document.createTextNode(r.name));
-      nameCell.appendChild(cell);
-      row.appendChild(nameCell);
+      row.appendChild(rowHeader(r.name));
 
       if (r.detailed) {
         [r.phases.dns, r.phases.connect, r.phases.wait, r.phases.download].forEach(function (value) {
@@ -1652,11 +1805,11 @@
 
     var head = el('thead');
     var headRow = el('tr');
-    headRow.appendChild(el('th', null, 'Host'));
-    for (var i = 1; i <= maxRuns; i++) headRow.appendChild(el('th', null, String(i)));
-    headRow.appendChild(el('th', null, 'Median'));
-    headRow.appendChild(el('th', null, 'Mean'));
-    headRow.appendChild(el('th', null, '± sd'));
+    headRow.appendChild(columnHeader('Host'));
+    for (var i = 1; i <= maxRuns; i++) headRow.appendChild(columnHeader(String(i)));
+    headRow.appendChild(columnHeader('Median'));
+    headRow.appendChild(columnHeader('Mean'));
+    headRow.appendChild(columnHeader('± sd'));
     head.appendChild(headRow);
     table.appendChild(head);
 
@@ -1671,12 +1824,7 @@
       var row = el('tr');
       row.style.setProperty('--host', r.colour);
 
-      var nameCell = el('td');
-      var cell = el('span', 'host-cell');
-      cell.appendChild(el('span', 'dot'));
-      cell.appendChild(document.createTextNode(r.name));
-      nameCell.appendChild(cell);
-      row.appendChild(nameCell);
+      row.appendChild(rowHeader(r.name));
 
       for (var i = 0; i < maxRuns; i++) {
         var sample = r.samples[i];
@@ -1766,7 +1914,6 @@
       toggle.type = 'checkbox';
       toggle.className = 'host-toggle';
       toggle.checked = host.enabled;
-      toggle.setAttribute('aria-label', 'Include ' + displayName(host) + ' in the test');
       toggle.addEventListener('change', function () {
         host.enabled = toggle.checked;
         card.dataset.enabled = String(host.enabled);
@@ -1796,19 +1943,34 @@
         if (refInput.checked) { state.referenceId = host.id; save(); }
       });
       ref.appendChild(refInput);
-      ref.appendChild(el('span', null, 'the original'));
+      // The visible text is the same on every card, which is fine to look at
+      // and useless to listen to: without a name of its own, every radio in the
+      // group announces "the original" and none of them says which host.
+      var refText = el('span', null, 'the original');
+      refText.setAttribute('aria-hidden', 'true');
+      ref.appendChild(refText);
       ref.title = 'The move check compares every other host against this one.';
       top.appendChild(ref);
 
       var remove = el('button', 'host-remove', '×');
       remove.type = 'button';
       remove.title = 'Remove this host';
-      remove.setAttribute('aria-label', 'Remove ' + displayName(host));
       remove.addEventListener('click', function () {
+        var name = displayName(host);
         state.hosts = state.hosts.filter(function (h) { return h !== host; });
-        if (state.referenceId === host.id && state.hosts.length) state.referenceId = state.hosts[0].id;
+        // Never leave the reference pointing at a card that no longer exists,
+        // or every later run reports that the marked original went missing.
+        if (state.referenceId === host.id) {
+          state.referenceId = state.hosts.length ? state.hosts[0].id : null;
+        }
         save();
         renderHosts();
+        // The button that had focus has just been destroyed, and without this
+        // focus falls to the top of the document.
+        var buttons = $('hosts').querySelectorAll('.host-remove');
+        if (buttons.length) buttons[Math.min(index, buttons.length - 1)].focus();
+        else $('add-preset').focus();
+        setStatus(name + ' removed.');
       });
       top.appendChild(remove);
       body.appendChild(top);
@@ -1839,7 +2001,15 @@
         } else {
           resolved.textContent = '→ ' + url;
         }
-        nameInput.placeholder = displayName(host);
+        // Every label that names this host has to be rebuilt here, not once at
+        // render time: renaming a card or pointing it somewhere else changes
+        // what it is called, and a control that announces the old name is how
+        // somebody deletes the wrong card.
+        var name = displayName(host);
+        nameInput.placeholder = name;
+        toggle.setAttribute('aria-label', 'Include ' + name + ' in the test');
+        remove.setAttribute('aria-label', 'Remove ' + name);
+        refInput.setAttribute('aria-label', 'Compare everything against ' + name + ', as the original');
         if (blurb) blurb.hidden = isShipped(host) && host.base !== defaultBaseFor(host.id);
       }
       input.addEventListener('input', function () {
@@ -1876,6 +2046,12 @@
       base: '',
       enabled: true
     });
+    // Somebody who removed every card and started again has marked nothing, so
+    // the first card back becomes the original rather than leaving the setting
+    // pointing at a host that is gone.
+    if (!state.hosts.some(function (h) { return h.id === state.referenceId; })) {
+      state.referenceId = state.hosts[0].id;
+    }
     save();
     renderHosts();
     // Focus the URL field of the card just added — the only thing to do next.
@@ -1886,15 +2062,12 @@
   function renderPresetPicker() {
     var select = $('add-preset');
     select.innerHTML = '';
-    var head = el('option', null, 'Add a host…');
-    head.value = '';
-    select.appendChild(head);
     PRESETS.forEach(function (preset) {
       var option = el('option', null, preset.name);
       option.value = preset.id;
       select.appendChild(option);
     });
-    select.value = '';
+    select.value = PRESETS[0].id;
   }
 
   function renderDatalists() {
@@ -2013,10 +2186,11 @@
     save();
   });
 
-  $('add-preset').addEventListener('change', function () {
-    if (!this.value) return;
-    addHost(this.value);
-    this.value = '';
+  // The picker chooses; the button acts. Acting on the select's change event
+  // would add a card on every arrow key, which puts the rest of the list out of
+  // reach of a keyboard and drops focus into a card nobody asked for.
+  $('add-host').addEventListener('click', function () {
+    addHost($('add-preset').value);
   });
 
   $('run').addEventListener('click', runTest);

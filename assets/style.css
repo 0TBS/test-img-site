@@ -6,13 +6,13 @@
   --surface-2: #f0f2f5;
   --ink:       #14181f;
   --ink-2:     #545c69;
-  --ink-3:     #838c9a;
+  --ink-3:     #6b7481;
   --line:      #e2e6ec;
   --line-2:    #cdd4de;
   --accent:    #2f6fd0;
   --accent-2:  #e8f0fc;
-  --good:      #1f8a5a;
-  --warn:      #b06a11;
+  --good:      #12704a;
+  --warn:      #8a5109;
   --bad:       #c4402f;
 
   --host-1: #2f6fd0;
@@ -144,7 +144,12 @@ code {
   border-radius: 10px;
   background: var(--surface-2);
 }
-.host[data-enabled="false"] { opacity: 0.55; }
+/* Unticking a card excludes it from a run; it does not disable its fields, so
+   fading the whole card would put editable text below the contrast the rest of
+   the page holds itself to. Fade the chrome, leave the controls alone. */
+.host[data-enabled="false"] { border-left-color: var(--line-2); }
+.host[data-enabled="false"] .dot { opacity: 0.35; }
+.host[data-enabled="false"] .host-blurb { color: var(--ink-3); }
 .host input[type="checkbox"] { margin: 6px 0 0; accent-color: var(--host); }
 
 .host-body { min-width: 0; display: grid; gap: 8px; }
@@ -333,6 +338,12 @@ code {
 /* ── tables ─────────────────────────────────────────────────────────── */
 
 .table-scroll { overflow-x: auto; margin: 0 -4px; padding: 0 4px; }
+/* These clip on a narrow screen, and an overflow container with nothing
+   focusable inside it cannot be scrolled by keyboard at all in some browsers. */
+.table-scroll:focus-visible, .chart-scroll:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 .grid { border-collapse: collapse; width: 100%; font-size: 13.5px; min-width: 480px; }
 .grid th, .grid td {
   text-align: right;
@@ -341,6 +352,7 @@ code {
   white-space: nowrap;
 }
 .grid th:first-child, .grid td:first-child { text-align: left; }
+.grid tbody th { font-weight: inherit; }
 .grid thead th {
   font-size: 12px;
   font-weight: 640;

@@ -42,9 +42,11 @@
     </div>
     <div class="hosts" id="hosts"><!-- rendered by app.js --></div>
     <div class="host-actions">
-      <select id="add-preset" aria-label="Add a host"></select>
-      <span class="field-hint">A preset only fills in a name, a description and a placeholder —
-        every card behaves the same way.</span>
+      <label class="field-label" for="add-preset">Add a host</label>
+      <select id="add-preset" aria-describedby="add-preset-hint"></select>
+      <button id="add-host" class="btn" type="button">Add</button>
+      <span class="field-hint" id="add-preset-hint">A preset only fills in a name, a description and a
+        placeholder — every card behaves the same way.</span>
     </div>
     <datalist id="known-bases"></datalist>
   </section>
@@ -57,34 +59,37 @@
     <div class="controls">
       <div class="field">
         <label class="field-label" for="payload">Which image</label>
-        <select id="payload"></select>
+        <select id="payload" aria-describedby="payload-hint"></select>
         <input type="text" id="custom-path" list="known-paths" spellcheck="false"
                placeholder="photos/hero.jpg" aria-label="Path to an image inside each host" hidden>
         <datalist id="known-paths"></datalist>
         <span class="field-hint" id="payload-hint"></span>
       </div>
 
-      <label class="field">
-        <span class="field-label">What to measure</span>
-        <select id="mode"></select>
+      <div class="field">
+        <label class="field-label" for="mode">What to measure</label>
+        <select id="mode" aria-describedby="mode-hint"></select>
         <span class="field-hint" id="mode-hint"></span>
-      </label>
+      </div>
 
-      <label class="field">
-        <span class="field-label">Runs per host</span>
-        <input type="number" id="runs" min="1" max="40" step="1" value="8">
-        <span class="field-hint">The order is reshuffled every run, so a passing wobble in your
-          connection cannot keep landing on the same host.</span>
-      </label>
+      <div class="field">
+        <label class="field-label" for="runs">Runs per host</label>
+        <input type="number" id="runs" min="1" max="40" step="1" value="8" aria-describedby="runs-hint">
+        <span class="field-hint" id="runs-hint">The order is reshuffled every run, so a passing wobble
+          in your connection cannot keep landing on the same host.</span>
+      </div>
 
-      <label class="field field-check">
-        <input type="checkbox" id="warmup" checked>
+      <div class="field field-check">
+        <input type="checkbox" id="warmup" checked aria-describedby="warmup-hint">
         <span>
-          <span class="field-label">Warm the connection first</span>
-          <span class="field-hint">One untimed request per host, so DNS, TCP and TLS are already
-            paid for. Turn this off to measure a cold visitor's very first image instead.</span>
+          <label class="field-label" for="warmup">Warm the connection first</label>
+          <span class="field-hint" id="warmup-hint">One untimed request per host, so DNS, TCP and TLS
+            are already paid for. Untick it and the timed runs start without that, so the first run
+            pays whatever setup the cross-origin probe has not already covered — this page cannot
+            offer a genuinely cold connection, because it has to ask each host what it allows before
+            it can measure anything.</span>
         </span>
-      </label>
+      </div>
 
       <div class="actions">
         <button id="run" class="btn btn-primary" type="button">Run the speed test</button>
@@ -113,7 +118,7 @@
     <div class="verdict" id="move-verdict"></div>
 
     <h3 class="sub">What each host is serving</h3>
-    <div class="table-scroll">
+    <div class="table-scroll" tabindex="0" role="region" aria-label="What each host is serving">
       <table class="grid" id="move-table"></table>
     </div>
     <p class="panel-note" id="move-digest-note"></p>
@@ -135,15 +140,15 @@
 
     <h3 class="sub">Where the time went</h3>
     <p class="panel-note" id="phases-note"></p>
-    <div class="table-scroll">
+    <div class="table-scroll" tabindex="0" role="region" aria-label="Where the time went, per host">
       <table class="grid" id="phases"></table>
     </div>
 
     <h3 class="sub">Run by run</h3>
-    <div class="chart-scroll">
+    <div class="chart-scroll" tabindex="0" role="region" aria-label="Load time of each run, per host">
       <svg id="runchart" class="runchart" role="img" aria-label="Load time of each run, per host"></svg>
     </div>
-    <div class="table-scroll">
+    <div class="table-scroll" tabindex="0" role="region" aria-label="Every run, per host">
       <table class="grid" id="runs-table"></table>
     </div>
   </section>
@@ -178,10 +183,12 @@
     <p>
       A card takes anything that answers over HTTP. For the <code>img.yourdomain.com</code>
       arrangement — a proxied CNAME to the bucket, a URL-rewrite rule that prepends the bucket name
-      to the path, and a response-header rule adding <code>Timing-Allow-Origin</code> — paste
-      <code>https://img.yourdomain.com/</code> as the base and put the object's key in the image
-      field. Paste the bucket's own endpoint into a second card and you are measuring exactly what
-      the Cloudflare record in front of it is buying you.
+      to the path, and a response-header rule adding both <code>Access-Control-Allow-Origin</code>
+      and <code>Timing-Allow-Origin</code> — paste <code>https://img.yourdomain.com/</code> as the
+      base and put the object's key in the image field. Paste the bucket's own endpoint into a second
+      card and you are measuring exactly what the Cloudflare record in front of it is buying you.
+      Both headers matter and for different reasons: without the first, the default repeat-visitor
+      mode cannot run at all; without the second, it runs but reports only totals.
     </p>
 
     <p>
@@ -274,10 +281,11 @@
     </p>
 
     <p>
-      It also proves the hosts served the same file. Where a cross-origin read is permitted, the byte
-      count is taken from the response body itself rather than from a header, so a host quietly
-      serving a smaller or re-encoded image is caught and the comparison is flagged as not
-      like-for-like. When that fires, the move check will tell you exactly how the two files differ.
+      It also watches the byte counts. Where a cross-origin read is permitted these are taken from
+      the response body itself rather than from a header, and a spread of more than a kilobyte
+      between hosts is flagged as not like-for-like. Matching counts are <em>consistent</em> with the
+      same file rather than proof of it — proving identity is the move check's job, and it is the one
+      that compares the bytes themselves.
     </p>
 
     <h3>Some hosts are not the same kind of thing</h3>
@@ -320,10 +328,13 @@
         total, and says so.
       </li>
       <li>
-        The move check reads the content type, size, cache and last-modified headers on any host that
-        permits a cross-origin read, because those few are readable by default. Anything else, such
-        as <code>cf-cache-status</code> or <code>etag</code>, needs the host to name it in an
-        <code>Access-Control-Expose-Headers</code> response header, and reads as missing otherwise.
+        The move check reads the content type and <code>Cache-Control</code> on any host that permits
+        a cross-origin read, because those are among the handful of headers a browser exposes by
+        default; the size is counted from the body rather than taken from a header at all. Anything
+        else, such as <code>cf-cache-status</code>, needs the host to name it in an
+        <code>Access-Control-Expose-Headers</code> response header. Where a host refuses the read
+        outright, none of its headers can be seen, and the report says <em>not readable</em> rather
+        than reporting them as absent.
       </li>
       <li>
         Nothing here can list what is <em>in</em> a bucket. Public object storage will serve you an
