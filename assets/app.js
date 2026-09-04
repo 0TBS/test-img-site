@@ -1,15 +1,28 @@
-/* GitHub vs Backblaze — image speed test.
+/* Image host speed test.
  *
- * Loads one image file from several hosts, one request at a time, and times each
- * one with the browser's Resource Timing API. No dependencies, no network calls
- * beyond the images themselves.
+ * Point it at any number of hosts — a Backblaze bucket, the same bucket behind a
+ * Cloudflare img.<domain> record, an R2 bucket, GitHub Pages, the WordPress site
+ * you are migrating away from — and it loads the same image from each of them,
+ * one request at a time, timing every one with the browser's Resource Timing API.
+ *
+ * Two instruments share the same list of hosts:
+ *
+ *   The speed test  — many timed runs per host, median, and a significance test,
+ *                     to answer "which of these is faster, and is that real?"
+ *   The move check  — one careful request per host, compared byte for byte
+ *                     against whichever host you mark as the original, to answer
+ *                     "did the file actually arrive intact, and is it being
+ *                     served properly?"
+ *
+ * No dependencies, no build step, no network calls beyond the images themselves.
  */
 (function () {
   'use strict';
 
   // ── configuration ───────────────────────────────────────────────────
 
-  var STORAGE_KEY = 'img-speed-test/v1';
+  var STORAGE_KEY = 'img-speed-test/v2';
+  var LEGACY_KEY = 'img-speed-test/v1'; // read once, to carry over remembered URLs
 
   // GitHub's raw endpoint for this repo. Change the owner/repo/branch if you
   // fork it; the payload file name is appended to whatever base you set.
@@ -51,11 +64,59 @@
     }
   ];
 
-  var PAYLOADS = [
-    { file: 'sample-small.jpg',  label: 'Small — 900 × 900, about 50 KB',      hint: 'A thumbnail or an icon. At this size connection setup dominates and the file itself is almost free.' },
-    { file: 'sample-medium.jpg', label: 'Medium — 1800 × 1800, about 250 KB',  hint: 'A typical content image on a well-built page. The usual sweet spot for telling two hosts apart.' },
-    { file: 'sample-large.jpg',  label: 'Large — 3200 × 3200, about 1.2 MB',   hint: 'An unoptimised hero image. Throughput matters more than latency here, so the gap usually widens.' }
+  // Starting points for a new card. Each one is an arrangement worth naming, so
+  // that adding a host is a matter of picking the shape and pasting a hostname
+  // rather than remembering what a bucket endpoint looks like.
+  var PRESETS = [
+    {
+      id: 'cloudflare',
+      name: 'Bucket behind Cloudflare',
+      blurb: 'A bucket served through one of your own Cloudflare DNS records — the img.<domain> arrangement: a proxied CNAME, a URL-rewrite rule that prepends the bucket to the path, and a response-header rule adding Timing-Allow-Origin.',
+      placeholder: 'https://img.yourdomain.com/'
+    },
+    {
+      id: 'b2',
+      name: 'Backblaze B2 bucket (direct)',
+      blurb: 'The bucket endpoint with nothing in front of it. Use the S3-style address — B2 applies bucket CORS rules to that one, and without a permitted cross-origin read this host can only be measured the crude way.',
+      placeholder: 'https://<bucket>.s3.us-east-005.backblazeb2.com/'
+    },
+    {
+      id: 'r2',
+      name: 'Cloudflare R2 bucket',
+      blurb: 'An R2 bucket on its own r2.dev address or on a custom domain of yours.',
+      placeholder: 'https://<id>.r2.dev/'
+    },
+    {
+      id: 'pages',
+      name: 'GitHub Pages',
+      blurb: 'A real static host with a CDN in front of it — the fair way to put GitHub in this comparison.',
+      placeholder: 'https://you.github.io/repo/'
+    },
+    {
+      id: 'wordpress',
+      name: 'The old WordPress site',
+      blurb: 'Where the images live today, before the move. Usually /wp-content/uploads/<year>/<month>/. Mark this one as the original and the move check compares everything else against it.',
+      placeholder: 'https://oldsite.com/wp-content/uploads/'
+    },
+    {
+      id: 'blank',
+      name: 'Somewhere else',
+      blurb: '',
+      placeholder: 'https://…/'
+    }
   ];
+
+  var CUSTOM_PAYLOAD = '__custom__';
+
+  var PAYLOADS = [
+    { file: 'sample-small.jpg',  label: 'Sample — small, 900 × 900, about 50 KB',      hint: 'A thumbnail or an icon. At this size connection setup dominates and the file itself is almost free. Only exists on hosts carrying this repo’s sample files.' },
+    { file: 'sample-medium.jpg', label: 'Sample — medium, 1800 × 1800, about 250 KB',  hint: 'A typical content image on a well-built page. The usual sweet spot for telling two hosts apart. Only exists on hosts carrying this repo’s sample files.' },
+    { file: 'sample-large.jpg',  label: 'Sample — large, 3200 × 3200, about 1.2 MB',   hint: 'An unoptimised hero image. Throughput matters more than latency here, so the gap usually widens. Only exists on hosts carrying this repo’s sample files.' },
+    { file: CUSTOM_PAYLOAD,      label: 'An image of your own',                        hint: 'The path to an image inside each bucket, appended to every base URL above. Leave it empty if every card already holds a whole image URL.' }
+  ];
+
+  var HOST_COLOURS = 8; // must match the --host-N custom properties in style.css
+  var MAX_RECENT = 12;
 
   var TIMEOUT_MS = 20000;
   var FAILED_TIMEOUT_MS = 4000; // short leash once a host has already failed
@@ -63,6 +124,7 @@
   var GAP_MS = 120;             // breathing room so requests never overlap
   var ENTRY_GRACE_MS = 250;     // how long to wait for a resource timing entry
   var PROBE_ATTEMPTS = 3;       // a dropped probe must not demote the method
+  var DECODE_TIMEOUT_MS = 8000; // long enough for a large image on a slow machine
 
   var MODES = [
     {
@@ -133,16 +195,45 @@
     return list;
   }
 
-  function joinUrl(base, file) {
+  function uid() {
+    return 'h' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  }
+
+  function colourFor(index) {
+    return 'var(--host-' + ((index % HOST_COLOURS) + 1) + ')';
+  }
+
+  // Is this base already a whole image URL rather than a directory to append to?
+  // Decided on the last segment of the *path*, so a bare hostname full of dots
+  // (img.example.com) is still a directory, and a trailing slash always is.
+  function looksLikeFile(base) {
+    var path;
+    try {
+      path = new URL(base).pathname;
+    } catch (err) {
+      path = String(base).replace(/^[a-z][a-z0-9+.\-]*:\/\/[^/]*/i, '').split(/[?#]/)[0];
+    }
+    var last = path.split('/').pop();
+    return last.indexOf('.') > 0;
+  }
+
+  // A base plus the chosen image path. A base that is already a whole file URL
+  // is used as it stands — which is how one card can point at the old site's
+  // /wp-content/uploads/… path while another points at a bucket key.
+  function resolveUrl(base, file) {
     var trimmed = String(base || '').trim();
     if (!trimmed) return '';
-    if (/\.(jpe?g|png|webp|avif|gif)$/i.test(trimmed)) return trimmed; // a full file URL
-    return trimmed.replace(/\/+$/, '') + '/' + file;
+    if (looksLikeFile(trimmed)) return trimmed;
+    if (!file) return '';
+    return trimmed.replace(/\/+$/, '') + '/' + String(file).replace(/^\/+/, '');
   }
 
   function bust(url) {
     var token = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-    return url + (url.indexOf('?') === -1 ? '?' : '&') + 'cb=' + token;
+    var hash = '';
+    var hashAt = url.indexOf('#');
+    if (hashAt >= 0) { hash = url.slice(hashAt); url = url.slice(0, hashAt); }
+    return url + (url.indexOf('?') === -1 ? '?' : '&') + 'cb=' + token + hash;
   }
 
   function formatP(p) {
@@ -154,19 +245,99 @@
     try { return new URL(url).host; } catch (err) { return url; }
   }
 
+  function fileLabel(url) {
+    try {
+      var path = new URL(url).pathname;
+      return path.split('/').filter(Boolean).pop() || path;
+    } catch (err) { return url; }
+  }
+
+  function toHex(u8) {
+    var out = '';
+    for (var i = 0; i < u8.length; i++) out += (u8[i] < 16 ? '0' : '') + u8[i].toString(16);
+    return out;
+  }
+
+  // A stand-in for SHA-256 where crypto.subtle is unavailable — notably on
+  // file://, which is not a secure context. Weaker, and labelled as such; the
+  // byte-for-byte comparison below never relies on it.
+  function fnv1a(u8) {
+    var hash = 0x811c9dc5;
+    for (var i = 0; i < u8.length; i++) {
+      hash ^= u8[i];
+      hash = (hash + ((hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24))) >>> 0;
+    }
+    return ('00000000' + hash.toString(16)).slice(-8);
+  }
+
+  function digestOf(buffer) {
+    var u8 = new Uint8Array(buffer);
+    if (window.crypto && crypto.subtle && crypto.subtle.digest) {
+      try {
+        return crypto.subtle.digest('SHA-256', buffer).then(function (hash) {
+          return { algo: 'SHA-256', hex: toHex(new Uint8Array(hash)) };
+        }, function () {
+          return { algo: 'FNV-1a', hex: fnv1a(u8) };
+        });
+      } catch (err) { /* fall through to the cheap one */ }
+    }
+    return Promise.resolve({ algo: 'FNV-1a', hex: fnv1a(u8) });
+  }
+
+  function sameBytes(a, b) {
+    if (!a || !b) return null;
+    if (a.byteLength !== b.byteLength) return false;
+    var x = new Uint8Array(a), y = new Uint8Array(b);
+    for (var i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+    return true;
+  }
+
   // ── state ───────────────────────────────────────────────────────────
 
+  function freshHosts() {
+    return DEFAULT_HOSTS.map(function (h) { return Object.assign({}, h, { label: '' }); });
+  }
+
   var state = {
-    hosts: DEFAULT_HOSTS.map(function (h) { return Object.assign({}, h); }),
+    hosts: freshHosts(),
     payload: PAYLOADS[1].file,
+    customPath: '',
     runs: 8,
     warmup: true,
-    mode: 'warm'
+    mode: 'warm',
+    referenceId: DEFAULT_HOSTS[0].id,
+    recentBases: [],
+    recentPaths: []
   };
 
   function defaultBaseFor(id) {
     var host = DEFAULT_HOSTS.filter(function (h) { return h.id === id; })[0];
     return host ? host.base : '';
+  }
+
+  function isShipped(host) {
+    return DEFAULT_HOSTS.some(function (h) { return h.id === host.id; });
+  }
+
+  // What to call a host in the tables and the verdict. A name you typed wins; a
+  // shipped card still sitting on its shipped URL keeps its shipped name; and
+  // anything else is named after the hostname it points at, which is always
+  // truthful and never goes stale.
+  function displayName(host) {
+    var typed = String(host.label || '').trim();
+    if (typed) return typed;
+    if (isShipped(host) && host.base === defaultBaseFor(host.id)) return host.name;
+    var base = String(host.base || '').trim();
+    if (base) return hostLabel(base);
+    return host.name || 'Unnamed host';
+  }
+
+  function remember(list, value) {
+    var trimmed = String(value || '').trim();
+    if (!trimmed) return list;
+    var next = list.filter(function (item) { return item !== trimmed; });
+    next.unshift(trimmed);
+    return next.slice(0, MAX_RECENT);
   }
 
   function save() {
@@ -177,40 +348,139 @@
         // wins on the next visit — otherwise a remembered blank would shadow
         // it forever and the host would silently never run.
         hosts: state.hosts.map(function (h) {
-          return { id: h.id, base: h.base, enabled: h.enabled, defaultBase: defaultBaseFor(h.id) };
+          return {
+            id: h.id,
+            name: h.name,
+            blurb: h.blurb,
+            placeholder: h.placeholder,
+            label: h.label,
+            base: h.base,
+            enabled: h.enabled,
+            defaultBase: defaultBaseFor(h.id)
+          };
         }),
         payload: state.payload,
+        customPath: state.customPath,
         runs: state.runs,
         warmup: state.warmup,
-        mode: state.mode
+        mode: state.mode,
+        referenceId: state.referenceId,
+        recentBases: state.recentBases,
+        recentPaths: state.recentPaths
       }));
     } catch (err) { /* private browsing, blocked storage — not worth reporting */ }
   }
 
-  function restore() {
+  // The saved list is authoritative about which cards exist and in what order —
+  // otherwise a card the visitor deleted would reappear on the next visit,
+  // because the shipped three are always there to be merged back in.
+  function hostFromEntry(entry) {
+    if (!entry || typeof entry !== 'object' || typeof entry.id !== 'string') return null;
+
+    var shipped = DEFAULT_HOSTS.filter(function (h) { return h.id === entry.id; })[0];
+    if (shipped) {
+      var host = Object.assign({}, shipped, { label: '' });
+      // A base remembered against a *different* shipped default was chosen by
+      // an older version of this page. The new default wins, or a remembered
+      // blank would shadow it forever and the host would silently never run.
+      if (entry.defaultBase === defaultBaseFor(entry.id) && typeof entry.base === 'string') {
+        host.base = entry.base;
+      }
+      if (typeof entry.enabled === 'boolean') host.enabled = entry.enabled;
+      if (typeof entry.label === 'string') host.label = entry.label;
+      return host;
+    }
+
+    // A card the visitor added themselves. Rebuilt whole, since nothing about
+    // it came from this build in the first place.
+    if (typeof entry.base !== 'string') return null;
+    return {
+      id: entry.id,
+      name: typeof entry.name === 'string' ? entry.name : 'Host',
+      blurb: typeof entry.blurb === 'string' ? entry.blurb : '',
+      placeholder: typeof entry.placeholder === 'string' ? entry.placeholder : '',
+      label: typeof entry.label === 'string' ? entry.label : '',
+      base: entry.base,
+      enabled: entry.enabled !== false
+    };
+  }
+
+  function readSaved(key) {
     var raw;
-    try { raw = localStorage.getItem(STORAGE_KEY); } catch (err) { return; }
-    if (!raw) return;
-    var saved;
-    try { saved = JSON.parse(raw); } catch (err) { return; }
-    if (!saved || typeof saved !== 'object') return;
+    try { raw = localStorage.getItem(key); } catch (err) { return null; }
+    if (!raw) return null;
+    try {
+      var parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch (err) { return null; }
+  }
+
+  function restore() {
+    // v1 knew only the three shipped hosts, so its entries all match by id and
+    // the loop below carries the visitor's URLs across without special cases.
+    var saved = readSaved(STORAGE_KEY) || readSaved(LEGACY_KEY);
+    if (!saved) return;
 
     if (Array.isArray(saved.hosts)) {
-      saved.hosts.forEach(function (entry) {
-        var host = state.hosts.filter(function (h) { return h.id === entry.id; })[0];
-        if (!host) return;
-        // Written by a version that shipped a different URL for this host (or
-        // by one that recorded no default at all). Keep the current default
-        // rather than restoring a value chosen against an older one.
-        if (entry.defaultBase !== defaultBaseFor(entry.id)) return;
-        if (typeof entry.base === 'string') host.base = entry.base;
-        if (typeof entry.enabled === 'boolean') host.enabled = entry.enabled;
-      });
+      var rebuilt = saved.hosts.map(hostFromEntry).filter(Boolean);
+      // An empty list is honoured when it was saved empty — the visitor removed
+      // every card, and the picker below is still there to add one. A list that
+      // failed to parse is not: the shipped set beats a blank page.
+      if (rebuilt.length || !saved.hosts.length) state.hosts = rebuilt;
     }
     if (PAYLOADS.some(function (p) { return p.file === saved.payload; })) state.payload = saved.payload;
+    if (typeof saved.customPath === 'string') state.customPath = saved.customPath;
     if (saved.runs >= 1 && saved.runs <= 40) state.runs = Math.round(saved.runs);
     if (typeof saved.warmup === 'boolean') state.warmup = saved.warmup;
     if (MODES.some(function (m) { return m.id === saved.mode; })) state.mode = saved.mode;
+    if (typeof saved.referenceId === 'string') state.referenceId = saved.referenceId;
+    if (Array.isArray(saved.recentBases)) {
+      state.recentBases = saved.recentBases.filter(function (v) { return typeof v === 'string'; }).slice(0, MAX_RECENT);
+    }
+    if (Array.isArray(saved.recentPaths)) {
+      state.recentPaths = saved.recentPaths.filter(function (v) { return typeof v === 'string'; }).slice(0, MAX_RECENT);
+    }
+  }
+
+  // ── the image being tested ──────────────────────────────────────────
+
+  function payloadFile() {
+    if (state.payload !== CUSTOM_PAYLOAD) return state.payload;
+    return String(state.customPath || '').trim().replace(/^\/+/, '');
+  }
+
+  function payloadDescription() {
+    var file = payloadFile();
+    if (file) return file;
+    return 'whatever each card points at';
+  }
+
+  function urlForHost(host) {
+    return resolveUrl(host.base, payloadFile());
+  }
+
+  function activeHosts() {
+    return state.hosts.filter(function (h) { return h.enabled && urlForHost(h); });
+  }
+
+  // The host every other host is compared against in the move check. An
+  // explicit choice if it is still enabled and resolvable, otherwise the first
+  // host that is — so removing or unticking the original never leaves the check
+  // with nothing to compare to.
+  function referenceHost(list) {
+    var chosen = list.filter(function (h) { return h.id === state.referenceId; })[0];
+    return chosen || list[0] || null;
+  }
+
+  function rememberCurrent() {
+    activeHosts().forEach(function (host) {
+      state.recentBases = remember(state.recentBases, host.base);
+    });
+    if (state.payload === CUSTOM_PAYLOAD) {
+      state.recentPaths = remember(state.recentPaths, payloadFile());
+    }
+    save();
+    renderDatalists();
   }
 
   // ── measurement ─────────────────────────────────────────────────────
@@ -377,6 +647,7 @@
       dns: null, connect: null, tls: null, wait: null, download: null,
       bytes: measuredBytes,
       measuredBytes: measuredBytes,
+      protocol: null,
       source: 'wallclock'
     };
     if (!ok) { result.total = null; return result; }
@@ -404,6 +675,9 @@
       result.wait = entry.responseStart - entry.requestStart;
       result.download = entry.responseEnd - entry.responseStart;
     }
+    // Also gated behind Timing-Allow-Origin, so it is empty for exactly the
+    // hosts whose phase breakdown is missing.
+    if (entry.nextHopProtocol) result.protocol = entry.nextHopProtocol;
     // A byte count read from the body itself is authoritative; the timing
     // entry's figures are only exposed to same-origin or Timing-Allow-Origin
     // hosts, so they are the fallback, not the source of truth.
@@ -460,31 +734,36 @@
     return z > 0 ? 1 - p : p;
   }
 
-  // ── the test ────────────────────────────────────────────────────────
+  // ── the speed test ──────────────────────────────────────────────────
 
   var running = false;
   var lastResults = null;
-  var lastMeta = null;
 
-  function activeHosts() {
-    return state.hosts.filter(function (h) {
-      return h.enabled && joinUrl(h.base, state.payload);
-    });
+  function busy(isBusy) {
+    running = isBusy;
+    ['run', 'move', 'race'].forEach(function (id) { $(id).disabled = isBusy; });
+  }
+
+  function noTargets(verb) {
+    var enabled = state.hosts.filter(function (h) { return h.enabled; });
+    if (!enabled.length) {
+      setStatus('Tick at least one host to ' + verb + '.', true);
+    } else if (state.payload === CUSTOM_PAYLOAD && !payloadFile()) {
+      setStatus('Type the path of an image to ' + verb + ' — or paste a whole image URL into a host card.', true);
+    } else {
+      setStatus('No host resolves to an image URL yet. Give one a base URL, or paste a whole image URL into it.', true);
+    }
   }
 
   async function runTest() {
     if (running) return;
 
     var hosts = activeHosts();
-    if (hosts.length < 2) {
-      setStatus('Give at least two hosts a base URL and tick them on — there is nothing to compare otherwise.', true);
-      return;
-    }
+    if (!hosts.length) { noTargets('test'); return; }
 
-    running = true;
-    $('run').disabled = true;
-    $('race').disabled = true;
+    busy(true);
     $('progress').hidden = false;
+    rememberCurrent();
 
     if (performance.setResourceTimingBufferSize) performance.setResourceTimingBufferSize(1000);
     if (performance.clearResourceTimings) performance.clearResourceTimings();
@@ -493,8 +772,9 @@
     var results = hosts.map(function (host, index) {
       return {
         host: host,
-        colour: 'var(--host-' + ((index % 3) + 1) + ')',
-        url: joinUrl(host.base, state.payload),
+        name: displayName(host),
+        colour: colourFor(index),
+        url: urlForHost(host),
         samples: [],
         failures: 0,
         abandoned: false
@@ -519,7 +799,7 @@
       mode: mode,
       requestedMode: state.mode,
       blockedBy: blockedBy,
-      payload: state.payload,
+      payload: payloadDescription(),
       runs: state.runs,
       warmup: state.warmup
     };
@@ -581,6 +861,7 @@
         stdev: stdev(times)
       };
       r.detailed = r.samples.some(function (s) { return s.detailed; });
+      r.protocol = (r.samples.filter(function (s) { return s.protocol; })[0] || {}).protocol || null;
       r.phases = {
         dns: median(r.samples.filter(function (s) { return s.detailed; }).map(function (s) { return s.dns; })),
         connect: median(r.samples.filter(function (s) { return s.detailed; }).map(function (s) { return s.connect; })),
@@ -601,16 +882,426 @@
     stopObserver();
 
     lastResults = results;
-    lastMeta = run_meta;
-    running = false;
-    $('run').disabled = false;
-    $('race').disabled = false;
+    busy(false);
     $('progress').hidden = true;
     $('progress-bar').style.width = '0';
-    setStatus('Done — ' + state.runs + ' runs per host on ' + state.payload
+    setStatus('Done — ' + state.runs + ' runs per host on ' + run_meta.payload
       + ' (' + (run_meta.mode === 'warm' ? 'repeat visitor' : 'first visitor') + ').');
     renderResults(results, run_meta);
     $('results').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  // ── the move check ──────────────────────────────────────────────────
+  //
+  // One request per host, read carefully rather than quickly. The question is
+  // not "how fast" but "is this the same file, and is it being served the way
+  // an image should be" — which is what actually goes wrong when images are
+  // copied from one host to another.
+
+  function decodeFromBlob(buffer, type) {
+    return new Promise(function (resolve) {
+      if (typeof URL === 'undefined' || !URL.createObjectURL) return resolve(null);
+      // Deliberately drop a non-image content type rather than passing it on:
+      // a JPEG mislabelled as application/octet-stream is one of the things
+      // this check exists to catch, and it must still be decodable here so the
+      // report can say "it is a real image, served under the wrong type".
+      var blob = new Blob([buffer], /^image\//i.test(type || '') ? { type: type } : undefined);
+      var objectUrl = URL.createObjectURL(blob);
+      var img = new Image();
+      var settled = false;
+      function finish(value) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        URL.revokeObjectURL(objectUrl);
+        resolve(value);
+      }
+      var timer = setTimeout(function () { finish(null); }, DECODE_TIMEOUT_MS);
+      img.onload = function () { finish({ width: img.naturalWidth, height: img.naturalHeight }); };
+      img.onerror = function () { finish(null); };
+      img.src = objectUrl;
+    });
+  }
+
+  // The fallback for a host that refuses a cross-origin read: an <img> can
+  // still load it, which proves the URL resolves and reveals the pixel
+  // dimensions, even though the bytes stay invisible to the page.
+  function decodeFromUrl(url) {
+    return new Promise(function (resolve) {
+      var img = new Image();
+      var settled = false;
+      function finish(value) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      }
+      var timer = setTimeout(function () { img.src = ''; finish(null); }, DECODE_TIMEOUT_MS);
+      img.onload = function () { finish({ width: img.naturalWidth, height: img.naturalHeight }); };
+      img.onerror = function () { finish(null); };
+      img.src = url;
+    });
+  }
+
+  function inspectHost(record) {
+    // Cache-busted deliberately: a move check asks what the host is holding
+    // now, not what an edge cached before the file was replaced.
+    var url = bust(record.url);
+    var info = {
+      url: record.url,
+      requested: url,
+      ok: false,
+      status: null,
+      error: null,
+      corsBlocked: false,
+      type: null,
+      cacheControl: null,
+      edge: null,
+      bytes: null,
+      buffer: null,
+      digest: null,
+      width: null,
+      height: null,
+      protocol: null,
+      tao: false,
+      total: null
+    };
+
+    var started = performance.now();
+
+    return fetch(url, { mode: 'cors', cache: 'no-store' })
+      .then(function (response) {
+        info.status = response.status;
+        info.ok = response.ok;
+        // Content-Type, Content-Length, Cache-Control, Expires and
+        // Last-Modified are CORS-safelisted, so they read cross-origin without
+        // the host doing anything. Anything else — cf-cache-status among them —
+        // needs Access-Control-Expose-Headers, and reads as null without it.
+        // Which is why a missing one is never reported as absent.
+        info.type = response.headers.get('content-type');
+        info.cacheControl = response.headers.get('cache-control');
+        info.edge = response.headers.get('cf-cache-status');
+        if (!response.ok) {
+          info.error = 'HTTP ' + response.status;
+          return null;
+        }
+        return response.arrayBuffer();
+      })
+      .catch(function () {
+        info.corsBlocked = true;
+        return null;
+      })
+      .then(function (buffer) {
+        info.total = performance.now() - started;
+        if (buffer) {
+          info.buffer = buffer;
+          info.bytes = buffer.byteLength;
+          return decodeFromBlob(buffer, info.type).then(function (size) {
+            if (size) { info.width = size.width; info.height = size.height; }
+            return digestOf(buffer).then(function (digest) { info.digest = digest; });
+          });
+        }
+        // The host answered with an error status. There is nothing an <img>
+        // would add: it would fail the same way, more slowly.
+        if (!info.corsBlocked) return null;
+        // A refused cross-origin read and a dead host look identical to fetch.
+        // An <img> tells them apart: if it loads, the host is up and simply
+        // will not be read by script — and its dimensions are visible anyway.
+        return decodeFromUrl(url).then(function (size) {
+          if (size) {
+            info.width = size.width;
+            info.height = size.height;
+            info.ok = true;
+            info.error = null;
+          } else if (!info.error) {
+            info.error = 'unreachable';
+          }
+        });
+      })
+      .then(function () {
+        return awaitEntry(url, ENTRY_GRACE_MS);
+      })
+      .then(function (entry) {
+        if (entry) {
+          if (entry.duration) info.total = entry.duration;
+          if (entry.responseStart > 0) info.tao = true;
+          if (entry.nextHopProtocol) info.protocol = entry.nextHopProtocol;
+          if (info.bytes == null && entry.encodedBodySize > 0) info.bytes = entry.encodedBodySize;
+        }
+        return info;
+      });
+  }
+
+  // What is wrong with this copy, in the order a person would want to hear it.
+  function auditCopy(info, reference) {
+    var flags = [];
+    var isReference = info === reference;
+
+    if (!info.ok) {
+      flags.push({ level: 'bad', text: info.corsBlocked
+        ? 'Nothing loaded from this URL at all — wrong path, wrong bucket, or the host is down.'
+        : 'The host answered ' + (info.error || 'with an error') + '. The file is not there.' });
+      return flags;
+    }
+
+    if (info.type && !/^image\//i.test(info.type)) {
+      flags.push({ level: 'bad', text: 'Served as ' + info.type + ', not an image type. Browsers may download it instead of displaying it, and some CDNs will not optimise it. This is what an upload that did not set a content type looks like — the usual souvenir of an rclone or S3 copy.' });
+    }
+
+    // Deliberately no Content-Length-against-body check: on a compressed
+    // response the header is the compressed size and the body is not, so it
+    // would report a phantom truncation — and a genuinely short body fails the
+    // fetch outright rather than arriving here.
+    if (info.buffer && info.bytes === 0) {
+      flags.push({ level: 'bad', text: 'The file is empty — nought bytes. The upload created the object but never wrote to it.' });
+    }
+
+    if (!isReference && reference && reference.ok) {
+      if (info.buffer && reference.buffer) {
+        if (sameBytes(info.buffer, reference.buffer)) {
+          flags.push({ level: 'good', text: 'Byte-for-byte identical to the original.' });
+        } else if (info.bytes != null && reference.bytes != null && info.bytes !== reference.bytes) {
+          var delta = info.bytes - reference.bytes;
+          flags.push({ level: 'bad', text: 'Different file: ' + bytes(Math.abs(delta)) + (delta < 0 ? ' smaller' : ' larger')
+            + ' than the original (' + bytes(info.bytes) + ' against ' + bytes(reference.bytes) + '). Something re-encoded or resized it on the way.' });
+        } else {
+          flags.push({ level: 'bad', text: 'The same number of bytes as the original, but not the same bytes. The file has been altered.' });
+        }
+      } else {
+        flags.push({ level: 'warn', text: 'The bytes could not be read on both sides, so identity is unproven. Dimensions and size are all this check can offer here.' });
+      }
+
+      if (info.width && reference.width && (info.width !== reference.width || info.height !== reference.height)) {
+        flags.push({ level: 'bad', text: 'Different pixel dimensions: ' + info.width + ' × ' + info.height
+          + ' against the original’s ' + reference.width + ' × ' + reference.height + '.' });
+      }
+
+      if (info.type && reference.type && info.type.split(';')[0] !== reference.type.split(';')[0]) {
+        flags.push({ level: 'warn', text: 'Content type differs from the original: ' + info.type + ' against ' + reference.type + '.' });
+      }
+    }
+
+    if (info.corsBlocked) {
+      flags.push({ level: 'warn', text: 'Refuses cross-origin reads, so scripts on your site cannot fetch it and this page cannot verify its bytes. On a Cloudflare-fronted bucket that means the Access-Control-Allow-Origin response-header rule is missing or scoped to a different hostname.' });
+    } else if (!info.tao) {
+      flags.push({ level: 'warn', text: 'No Timing-Allow-Origin header, so neither this page nor your own monitoring can see where the time goes on this host — only the total.' });
+    }
+
+    // Only readable where the host names it in Access-Control-Expose-Headers,
+    // so it is reported when present and never inferred from its absence. MISS
+    // is expected here and says nothing: this request carried a cache-buster.
+    if (/^(DYNAMIC|BYPASS)$/i.test(String(info.edge || ''))) {
+      flags.push({ level: 'warn', text: 'Cloudflare reports cf-cache-status: ' + info.edge
+        + ', so it is not caching this at the edge at all — every request travels to the bucket. That is the CDN in front of it doing nothing.' });
+    }
+
+    var cache = String(info.cacheControl || '');
+    var maxAge = /max-age=(\d+)/i.exec(cache);
+    if (!cache) {
+      flags.push({ level: 'warn', text: 'No Cache-Control header. Every visitor, and every CDN edge, has to guess how long to keep it — usually meaning they re-fetch it far too often.' });
+    } else if (/no-store|no-cache/i.test(cache)) {
+      flags.push({ level: 'warn', text: 'Cache-Control says ' + cache + ', so nothing may cache it. For an image that never changes, that is throwing the CDN away.' });
+    } else if (maxAge && Number(maxAge[1]) < 86400) {
+      flags.push({ level: 'warn', text: 'Cache-Control keeps it for only ' + maxAge[1] + ' seconds. Images that never change are normally set to a year and marked immutable.' });
+    }
+
+    if (!flags.length) flags.push({ level: 'good', text: 'Nothing to report.' });
+    return flags;
+  }
+
+  async function runMoveCheck() {
+    if (running) return;
+
+    var hosts = activeHosts();
+    if (!hosts.length) { noTargets('check'); return; }
+
+    busy(true);
+    $('progress').hidden = false;
+    rememberCurrent();
+
+    if (performance.clearResourceTimings) performance.clearResourceTimings();
+    startObserver();
+
+    var records = hosts.map(function (host, index) {
+      return { host: host, name: displayName(host), colour: colourFor(index), url: urlForHost(host) };
+    });
+
+    var reference = referenceHost(hosts);
+    // The card marked as the original may have been unticked, emptied or
+    // removed since. Something still has to be the reference, but the report
+    // has to say that it was not the one chosen.
+    var markedMissing = !hosts.some(function (h) { return h.id === state.referenceId; });
+    var checked = [];
+    for (var i = 0; i < records.length; i++) {
+      setStatus('Checking ' + records[i].name + '…');
+      var info = await inspectHost(records[i]);
+      info.record = records[i];
+      info.isReference = records[i].host === reference;
+      checked.push(info);
+      $('progress-bar').style.width = ((i + 1) / records.length * 100) + '%';
+      await sleep(GAP_MS);
+    }
+
+    stopObserver();
+
+    var referenceInfo = checked.filter(function (info) { return info.isReference; })[0] || checked[0];
+    checked.forEach(function (info) { info.flags = auditCopy(info, referenceInfo); });
+
+    busy(false);
+    $('progress').hidden = true;
+    $('progress-bar').style.width = '0';
+    setStatus('Move check done — ' + checked.length + ' host' + (checked.length === 1 ? '' : 's') + ' inspected.');
+    renderMoveReport(checked, referenceInfo, markedMissing);
+    $('move-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  function renderMoveReport(checked, reference, markedMissing) {
+    $('move-panel').hidden = false;
+
+    var box = $('move-verdict');
+    box.innerHTML = '';
+
+    var others = checked.filter(function (info) { return info !== reference; });
+    // Anything the audit called "bad" that is not about identity: a file can be
+    // the right bytes and still be served in a way that breaks it.
+    var served = checked.filter(function (info) {
+      return info.ok && info.flags.some(function (f) { return f.level === 'bad'; });
+    });
+
+    var headline;
+    if (!reference || !reference.ok) {
+      headline = 'The original could not be read.';
+    } else if (!others.length) {
+      headline = served.length
+        ? 'The file is there, but not being served properly.'
+        : 'One host checked — nothing to compare it against.';
+    } else {
+      var identical = others.filter(function (info) {
+        return info.buffer && reference.buffer && sameBytes(info.buffer, reference.buffer);
+      }).length;
+      var broken = others.filter(function (info) { return !info.ok; }).length;
+      if (broken) {
+        headline = broken === others.length
+          ? (broken === 1 ? 'The copy did not load at all.' : 'None of the copies loaded at all.')
+          : broken + ' of ' + others.length + ' copies did not load at all.';
+      } else if (identical === others.length) {
+        // The bytes matching is not the same as the move having worked. Saying
+        // "identical" over the top of a wrong content type would be the exact
+        // false all-clear this check exists to prevent.
+        headline = served.length
+          ? (others.length === 1
+              ? 'The bytes match, but the copy is not being served properly.'
+              : 'The bytes all match, but ' + served.length + ' host'
+                + (served.length === 1 ? ' is' : 's are') + ' not serving them properly.')
+          : (others.length === 1
+              ? 'The copy is byte-for-byte identical to the original.'
+              : 'All ' + others.length + ' copies are byte-for-byte identical to the original.');
+      } else if (identical) {
+        headline = identical + ' of ' + others.length + ' copies match the original byte for byte.';
+      } else {
+        headline = 'No copy could be proved identical to the original.';
+      }
+    }
+    box.appendChild(el('p', 'verdict-headline', headline));
+
+    var detail = el('p', 'verdict-detail');
+    detail.textContent = reference
+      ? 'Compared against ' + reference.record.name + ' (' + hostLabel(reference.url) + '), marked as the original. '
+        + 'Each host was requested once, with a cache-busting token, so this describes what the host is holding now rather than what an edge cached earlier.'
+      : 'Nothing to compare.';
+    box.appendChild(detail);
+
+    if (markedMissing && reference) {
+      box.appendChild(el('p', 'verdict-caveat',
+        'The card you marked as the original is not in this run — it is unticked, empty, or gone — so '
+        + reference.record.name + ' stood in for it.'));
+    }
+
+    var worst = checked.some(function (info) {
+      return info.flags.some(function (f) { return f.level === 'bad'; });
+    });
+    if (!worst && checked.length > 1) {
+      box.appendChild(el('p', 'verdict-detail',
+        'Nothing here blocks the move. Run the speed test next to see whether the new host is actually quicker.'));
+    }
+
+    var table = $('move-table');
+    table.innerHTML = '';
+
+    var head = el('thead');
+    var headRow = el('tr');
+    ['Host', 'Result', 'Type', 'Size', 'Pixels', 'Cache-Control', 'Protocol', 'Digest'].forEach(function (label) {
+      headRow.appendChild(el('th', null, label));
+    });
+    head.appendChild(headRow);
+    table.appendChild(head);
+
+    var body = el('tbody');
+    checked.forEach(function (info) {
+      var row = el('tr');
+      row.style.setProperty('--host', info.record.colour);
+
+      var nameCell = el('td');
+      var cell = el('span', 'host-cell');
+      cell.appendChild(el('span', 'dot'));
+      cell.appendChild(document.createTextNode(info.record.name));
+      nameCell.appendChild(cell);
+      row.appendChild(nameCell);
+
+      var verdictCell = el('td');
+      var badge;
+      if (!info.ok) {
+        badge = el('span', 'badge bad', info.error || 'failed');
+      } else if (info.isReference) {
+        badge = el('span', 'badge', 'reference');
+      } else if (info.buffer && reference && reference.buffer) {
+        badge = sameBytes(info.buffer, reference.buffer)
+          ? el('span', 'badge good', 'identical')
+          : el('span', 'badge bad', 'different');
+      } else {
+        badge = el('span', 'badge warn', 'unverified');
+      }
+      verdictCell.appendChild(badge);
+      row.appendChild(verdictCell);
+
+      row.appendChild(el('td', info.type ? null : 'miss', info.type ? info.type.split(';')[0] : 'unknown'));
+      row.appendChild(el('td', info.bytes ? null : 'miss', info.bytes ? bytes(info.bytes) : 'not readable'));
+      row.appendChild(el('td', info.width ? null : 'miss', info.width ? info.width + ' × ' + info.height : 'not decoded'));
+      row.appendChild(el('td', 'wrap-cell' + (info.cacheControl ? '' : ' miss'), info.cacheControl || 'none'));
+      row.appendChild(el('td', info.protocol ? null : 'miss', info.protocol || 'not exposed'));
+      row.appendChild(el('td', info.digest ? 'digest' : 'miss',
+        info.digest ? info.digest.hex.slice(0, 12) : 'not readable'));
+
+      body.appendChild(row);
+    });
+    table.appendChild(body);
+
+    var notes = $('move-notes');
+    notes.innerHTML = '';
+    checked.forEach(function (info) {
+      var group = el('div', 'note-group');
+      group.style.setProperty('--host', info.record.colour);
+
+      var title = el('p', 'note-title');
+      title.appendChild(el('span', 'dot'));
+      title.appendChild(document.createTextNode(info.record.name));
+      var url = el('span', 'note-url', info.url);
+      title.appendChild(url);
+      group.appendChild(title);
+
+      var list = el('ul', 'note-list');
+      info.flags.forEach(function (flag) {
+        var item = el('li', 'note ' + flag.level, flag.text);
+        list.appendChild(item);
+      });
+      group.appendChild(list);
+      notes.appendChild(group);
+    });
+
+    var digests = checked.filter(function (info) { return info.digest; });
+    $('move-digest-note').textContent = digests.length
+      ? 'Digests are ' + digests[0].digest.algo + ', truncated for display. Identity above is decided by comparing the bytes themselves, not by the digest.'
+      : 'No digests: the bytes of these hosts could not be read by script, so identity could not be proved.';
   }
 
   // ── rendering: results ──────────────────────────────────────────────
@@ -624,15 +1315,124 @@
     renderRunsTable(results);
   }
 
+  function renderHow(meta) {
+    // Say plainly what was measured. The same hosts give very different answers
+    // cold and warm, and a reader who does not know which they are looking at
+    // cannot use the number.
+    var how = el('p', 'verdict-detail');
+    how.textContent = meta.mode === 'warm'
+      ? 'Measured as a repeat visitor: stable URLs with the browser cache bypassed, so any host with a CDN in front of it answered from its edge.'
+      : 'Measured as a first visitor: every URL uniquely cache-busted, so each request missed the browser cache and any CDN edge and went to the origin.';
+    if (meta.method === 'image') {
+      how.textContent += ' Timed by image load rather than fetch, because '
+        + meta.blockedBy.join(' and ') + ' would not permit a cross-origin read.';
+    }
+    return how;
+  }
+
+  function collectCaveats(results, finished, meta, comparing) {
+    var caveats = [];
+
+    // Fairness first: a speed comparison between hosts serving different bytes
+    // is not a comparison at all.
+    if (comparing) {
+      var sizes = finished.map(function (r) { return r.bytes; }).filter(Boolean);
+      var allProven = finished.every(function (r) { return r.bytesMeasured; });
+      if (sizes.length === finished.length && Math.max.apply(null, sizes) - Math.min.apply(null, sizes) > 1024) {
+        caveats.push('The hosts returned different byte counts (' +
+          finished.map(function (r) { return r.name + ': ' + bytes(r.bytes); }).join(', ') +
+          '). They are not serving the same file, so this is not a like-for-like comparison. The move check will tell you exactly how they differ.');
+      } else if (!allProven) {
+        caveats.push('Byte counts could not be confirmed for every host, so the page cannot prove they served identical files. Run the move check before trusting the ranking.');
+      }
+
+      // Two cards pointing at the same URL race the same object against itself.
+      var urls = {};
+      var duplicated = [];
+      finished.forEach(function (r) {
+        if (urls[r.url]) duplicated.push(r.url); else urls[r.url] = true;
+      });
+      if (duplicated.length) {
+        caveats.push('Two or more hosts resolve to the same URL (' + duplicated[0] + '), so they are not two hosts. Give them different base URLs.');
+      }
+    }
+
+    var failed = results.filter(function (r) { return r.failures > 0; });
+    if (failed.length) {
+      caveats.push(failed.map(function (r) {
+        return r.name + ' failed ' + r.failures + ' of ' + (r.failures + r.stats.n) + ' requests'
+          + (r.abandoned ? ' and was dropped after the first two' : '');
+      }).join('; ') + '. Failures are excluded from the medians above.');
+    }
+    if (meta.requestedMode === 'warm' && meta.mode === 'cold') {
+      caveats.push('Repeat-visitor mode was requested but could not be used: ' + meta.blockedBy.join(' and ')
+        + ' would not permit a cross-origin read, so every host fell back to cache-busted first-visitor requests. '
+        + 'That removes the CDN advantage this test is meant to show.');
+    }
+    if (meta.runs < 5) {
+      caveats.push('Fewer than five runs per host. That is enough for a rough look and not enough to trust.');
+    }
+    var mixed = finished.filter(function (r) { return r.wallclockRuns > 0; });
+    if (mixed.length) {
+      caveats.push(mixed.map(function (r) {
+        return r.name + ' had ' + r.wallclockRuns + ' of ' + r.stats.n
+          + ' runs timed by wall clock because no resource timing entry arrived';
+      }).join('; ') + '. Those readings include a little scheduling overhead the others do not.');
+    }
+    finished.forEach(function (r) {
+      if (r.stats.stdev && r.stats.stdev > r.stats.median * 0.5) {
+        caveats.push('The run-to-run spread for ' + r.name + ' is wider than half its median, so your connection was unsettled. Run it again before drawing a conclusion.');
+      }
+    });
+
+    return caveats;
+  }
+
   function renderVerdict(results, meta) {
     var box = $('verdict');
     box.innerHTML = '';
 
     var finished = results.filter(function (r) { return r.stats.n > 0; });
-    if (finished.length < 2) {
-      box.appendChild(el('p', 'verdict-headline', 'Not enough successful runs to compare.'));
+    if (!finished.length) {
+      box.appendChild(el('p', 'verdict-headline', 'Nothing loaded.'));
       box.appendChild(el('p', 'verdict-detail',
-        'At least one host returned nothing. Check the URL, and check that the file exists at that path.'));
+        'No host returned a single successful request. Check the URLs, and check that the image exists at that path — the move check reports exactly what each host said.'));
+      collectCaveats(results, finished, meta, false)
+        .forEach(function (text) { box.appendChild(el('p', 'verdict-caveat', text)); });
+      return;
+    }
+
+    // One host is a legitimate run — measuring a single new img.<domain> record
+    // is a real question — but it is a measurement, not a comparison, and the
+    // verdict must not dress it up as one.
+    if (finished.length === 1) {
+      var only = finished[0];
+      box.appendChild(el('p', 'verdict-headline', only.name + ' — ' + ms(only.stats.median) + ' median'));
+
+      var solo = el('p', 'verdict-detail');
+      solo.textContent = 'Over ' + only.stats.n + ' runs of ' + fileLabel(only.url) + ': fastest '
+        + ms(only.stats.min) + ', slowest ' + ms(only.stats.max)
+        + (only.stats.stdev == null ? '' : ', spread ± ' + ms(only.stats.stdev)) + '. '
+        + 'Nothing to rank it against — add a second host to get a comparison.';
+      box.appendChild(solo);
+      box.appendChild(renderHow(meta));
+
+      var exposure = el('p', 'verdict-detail');
+      exposure.textContent = hostLabel(only.url) + ' '
+        + (meta.method === 'fetch' ? 'permits cross-origin reads' : 'refuses cross-origin reads')
+        + ' and ' + (only.detailed ? 'sends Timing-Allow-Origin, so the phase breakdown below is real'
+          : 'sends no Timing-Allow-Origin, so only the total is visible')
+        + (only.protocol ? '. It answered over ' + only.protocol + '.' : '.');
+      box.appendChild(exposure);
+
+      if (results.length > 1) {
+        box.appendChild(el('p', 'verdict-caveat',
+          'Only one host produced any measurements — the others failed every request, so this is not the comparison you asked for.'));
+      }
+
+      collectCaveats(results, finished, meta, false)
+        .forEach(function (text) { box.appendChild(el('p', 'verdict-caveat', text)); });
+      box.appendChild(renderLimits(meta, finished));
       return;
     }
 
@@ -654,9 +1454,9 @@
     if (!separated) {
       headline = 'Too close to call.';
     } else if (ratio < 1.1) {
-      headline = winner.host.name + ' edged it.';
+      headline = winner.name + ' edged it.';
     } else {
-      headline = winner.host.name + ' won, by ' + ratio.toFixed(1) + '×.';
+      headline = winner.name + ' won, by ' + ratio.toFixed(1) + '×.';
     }
     box.appendChild(el('p', 'verdict-headline', headline));
 
@@ -669,23 +1469,12 @@
       'practice because browsers fetch several at once.';
     box.appendChild(detail);
 
-    // Say plainly what was measured. The same three hosts give very different
-    // answers cold and warm, and a reader who does not know which they are
-    // looking at cannot use the number.
-    var how = el('p', 'verdict-detail');
-    how.textContent = meta.mode === 'warm'
-      ? 'Measured as a repeat visitor: stable URLs with the browser cache bypassed, so any host with a CDN in front of it answered from its edge.'
-      : 'Measured as a first visitor: every URL uniquely cache-busted, so each request missed the browser cache and any CDN edge and went to the origin.';
-    if (meta.method === 'image') {
-      how.textContent += ' Timed by image load rather than fetch, because '
-        + meta.blockedBy.join(' and ') + ' would not permit a cross-origin read.';
-    }
-    box.appendChild(how);
+    box.appendChild(renderHow(meta));
 
     var stat = el('p', 'verdict-detail');
     if (test) {
       stat.textContent = separated
-        ? 'The gap against ' + ranked[1].host.name + ' holds up against the run-to-run noise (Mann-Whitney p ≈ '
+        ? 'The gap against ' + ranked[1].name + ' holds up against the run-to-run noise (Mann-Whitney p ≈ '
           + formatP(test.p) + ' over ' + winner.stats.n + ' and ' + ranked[1].stats.n + ' runs).'
         : 'The spread between runs is wide enough that this ordering could be noise (Mann-Whitney p ≈ '
           + formatP(test.p) + '). Treat the ranking as unproven and run it again, or raise the run count.';
@@ -694,45 +1483,8 @@
     }
     box.appendChild(stat);
 
-    var caveats = [];
-
-    // Fairness first: a speed comparison between hosts serving different bytes
-    // is not a comparison at all.
-    var sizes = finished.map(function (r) { return r.bytes; }).filter(Boolean);
-    var allProven = finished.every(function (r) { return r.bytesMeasured; });
-    if (sizes.length === finished.length && Math.max.apply(null, sizes) - Math.min.apply(null, sizes) > 1024) {
-      caveats.push('The hosts returned different byte counts (' +
-        finished.map(function (r) { return hostLabel(r.url) + ': ' + bytes(r.bytes); }).join(', ') +
-        '). They are not serving the same file, so this is not a like-for-like comparison.');
-    } else if (!allProven) {
-      caveats.push('Byte counts could not be confirmed for every host, so the page cannot prove they served identical files. Check that yourself before trusting the ranking.');
-    }
-    var failed = results.filter(function (r) { return r.failures > 0; });
-    if (failed.length) {
-      caveats.push(failed.map(function (r) {
-        return hostLabel(r.url) + ' failed ' + r.failures + ' of ' + (r.failures + r.stats.n) + ' requests'
-          + (r.abandoned ? ' and was dropped after the first two' : '');
-      }).join('; ') + '. Failures are excluded from the medians above.');
-    }
-    if (meta.requestedMode === 'warm' && meta.mode === 'cold') {
-      caveats.push('Repeat-visitor mode was requested but could not be used: ' + meta.blockedBy.join(' and ')
-        + ' would not permit a cross-origin read, so every host fell back to cache-busted first-visitor requests. '
-        + 'That removes the CDN advantage this test is meant to show.');
-    }
-    if (state.runs < 5) {
-      caveats.push('Fewer than five runs per host. That is enough for a rough look and not enough to trust.');
-    }
-    var mixed = finished.filter(function (r) { return r.wallclockRuns > 0; });
-    if (mixed.length) {
-      caveats.push(mixed.map(function (r) {
-        return hostLabel(r.url) + ' had ' + r.wallclockRuns + ' of ' + r.stats.n
-          + ' runs timed by wall clock because no resource timing entry arrived';
-      }).join('; ') + '. Those readings include a little scheduling overhead the others do not.');
-    }
-    if (winner.stats.stdev && winner.stats.stdev > winner.stats.median * 0.5) {
-      caveats.push('The run-to-run spread is wider than half the median, so your connection was unsettled. Run it again before drawing a conclusion.');
-    }
-    caveats.forEach(function (text) { box.appendChild(el('p', 'verdict-caveat', text)); });
+    collectCaveats(results, finished, meta, true)
+      .forEach(function (text) { box.appendChild(el('p', 'verdict-caveat', text)); });
 
     box.appendChild(renderLimits(meta, finished));
   }
@@ -750,7 +1502,9 @@
       'It measures ' + (meta.mode === 'warm'
         ? 'the repeat-visitor path, with any CDN edge warm. A first visitor to a cold edge will see slower numbers than these.'
         : 'the first-visitor path, with every cache missed. Ordinary visitors to a host with a CDN will see faster numbers than these.'),
-      'It compares ' + finished.length + ' host' + (finished.length === 1 ? '' : 's') + ' on one file of one size. Ranking can and does change with payload size — try the other sizes before concluding anything.',
+      finished.length === 1
+        ? 'It measures one host on one file of one size, and says nothing about how that compares to anywhere else.'
+        : 'It compares ' + finished.length + ' hosts on one file of one size. Ranking can and does change with payload size — try a larger image before concluding anything.',
       'Timings come from the browser, which deliberately coarsens its clocks. Differences of a millisecond or two are below the noise floor and should be read as "the same".',
       'A single run of this page is one sample of a noisy process. Agreement across several runs at different times of day is worth far more than one decisive-looking result.'
     ].forEach(function (text) { list.appendChild(el('li', null, text)); });
@@ -771,7 +1525,7 @@
 
       var meta = el('div', 'bar-meta');
       var left = el('span');
-      left.appendChild(el('b', null, r.host.name));
+      left.appendChild(el('b', null, r.name));
       left.appendChild(document.createTextNode('  ' + hostLabel(r.url)));
       meta.appendChild(left);
 
@@ -804,7 +1558,7 @@
 
     var head = el('thead');
     var headRow = el('tr');
-    ['Host', 'DNS', 'Connect + TLS', 'Waiting', 'Downloading', 'Total', 'Size'].forEach(function (label) {
+    ['Host', 'DNS', 'Connect + TLS', 'Waiting', 'Downloading', 'Total', 'Size', 'Protocol'].forEach(function (label) {
       headRow.appendChild(el('th', null, label));
     });
     head.appendChild(headRow);
@@ -818,7 +1572,7 @@
       var nameCell = el('td');
       var cell = el('span', 'host-cell');
       cell.appendChild(el('span', 'dot'));
-      cell.appendChild(document.createTextNode(r.host.name));
+      cell.appendChild(document.createTextNode(r.name));
       nameCell.appendChild(cell);
       row.appendChild(nameCell);
 
@@ -831,6 +1585,7 @@
       }
       row.appendChild(el('td', null, ms(r.stats.median)));
       row.appendChild(el('td', r.bytes ? null : 'miss', r.bytes ? bytes(r.bytes) : 'not exposed'));
+      row.appendChild(el('td', r.protocol ? null : 'miss', r.protocol || 'not exposed'));
       body.appendChild(row);
     });
     table.appendChild(body);
@@ -919,7 +1674,7 @@
       var nameCell = el('td');
       var cell = el('span', 'host-cell');
       cell.appendChild(el('span', 'dot'));
-      cell.appendChild(document.createTextNode(r.host.name));
+      cell.appendChild(document.createTextNode(r.name));
       nameCell.appendChild(cell);
       row.appendChild(nameCell);
 
@@ -941,29 +1696,26 @@
   function runRace() {
     if (running) return;
     var hosts = activeHosts();
-    if (hosts.length < 2) {
-      setStatus('Give at least two hosts a base URL and tick them on — there is nothing to race.', true);
-      return;
-    }
+    if (!hosts.length) { noTargets('race'); return; }
 
     $('race-panel').hidden = false;
     var track = $('race-track');
     track.innerHTML = '';
 
     var lanes = hosts.map(function (host, index) {
-      var url = bust(joinUrl(host.base, state.payload));
+      var url = bust(urlForHost(host));
       var lane = el('div', 'lane');
-      lane.style.setProperty('--host', 'var(--host-' + ((index % 3) + 1) + ')');
+      lane.style.setProperty('--host', colourFor(index));
 
       var head = el('div', 'lane-head');
-      head.appendChild(el('b', null, host.name));
+      head.appendChild(el('b', null, displayName(host)));
       var time = el('span', 'lane-time', 'loading…');
       head.appendChild(time);
       lane.appendChild(head);
 
       var frame = el('div', 'lane-frame');
       var img = new Image();
-      img.alt = host.name + ' sample image';
+      img.alt = displayName(host) + ' sample image';
       frame.appendChild(el('span', 'placeholder', 'waiting'));
       lane.appendChild(frame);
       track.appendChild(lane);
@@ -993,7 +1745,9 @@
       entry.img.src = entry.url;
     });
 
-    setStatus('Racing — both requests are in flight at once.');
+    setStatus(lanes.length === 1
+      ? 'Loading the image, so you can see it.'
+      : 'Racing — every request is in flight at once.');
     $('race-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
@@ -1005,13 +1759,14 @@
 
     state.hosts.forEach(function (host, index) {
       var card = el('div', 'host');
-      card.style.setProperty('--host', 'var(--host-' + ((index % 3) + 1) + ')');
+      card.style.setProperty('--host', colourFor(index));
       card.dataset.enabled = String(host.enabled);
 
       var toggle = el('input');
       toggle.type = 'checkbox';
+      toggle.className = 'host-toggle';
       toggle.checked = host.enabled;
-      toggle.setAttribute('aria-label', 'Include ' + host.name + ' in the test');
+      toggle.setAttribute('aria-label', 'Include ' + displayName(host) + ' in the test');
       toggle.addEventListener('change', function () {
         host.enabled = toggle.checked;
         card.dataset.enabled = String(host.enabled);
@@ -1021,27 +1776,79 @@
 
       var body = el('div', 'host-body');
 
-      var name = el('div', 'host-name');
-      name.appendChild(el('span', 'dot'));
-      name.appendChild(document.createTextNode(host.name));
-      body.appendChild(name);
+      var top = el('div', 'host-top');
+      top.appendChild(el('span', 'dot'));
 
-      body.appendChild(el('p', 'host-blurb', host.blurb));
+      var nameInput = el('input', 'host-name-input');
+      nameInput.type = 'text';
+      nameInput.value = host.label || '';
+      nameInput.placeholder = displayName(host);
+      nameInput.spellcheck = false;
+      nameInput.setAttribute('aria-label', 'Name for this host');
+      top.appendChild(nameInput);
+
+      var ref = el('label', 'host-ref');
+      var refInput = el('input');
+      refInput.type = 'radio';
+      refInput.name = 'reference';
+      refInput.checked = host.id === state.referenceId;
+      refInput.addEventListener('change', function () {
+        if (refInput.checked) { state.referenceId = host.id; save(); }
+      });
+      ref.appendChild(refInput);
+      ref.appendChild(el('span', null, 'the original'));
+      ref.title = 'The move check compares every other host against this one.';
+      top.appendChild(ref);
+
+      var remove = el('button', 'host-remove', '×');
+      remove.type = 'button';
+      remove.title = 'Remove this host';
+      remove.setAttribute('aria-label', 'Remove ' + displayName(host));
+      remove.addEventListener('click', function () {
+        state.hosts = state.hosts.filter(function (h) { return h !== host; });
+        if (state.referenceId === host.id && state.hosts.length) state.referenceId = state.hosts[0].id;
+        save();
+        renderHosts();
+      });
+      top.appendChild(remove);
+      body.appendChild(top);
+
+      // A shipped card's description names a specific host, so it becomes a lie
+      // the moment the card is pointed somewhere else. A preset's description
+      // is about the arrangement rather than the URL, so it stays true.
+      var blurb = host.blurb ? el('p', 'host-blurb', host.blurb) : null;
+      if (blurb) body.appendChild(blurb);
 
       var input = el('input', 'host-url');
-      input.type = 'url';
+      input.type = 'text';
       input.value = host.base;
       input.placeholder = host.placeholder || 'https://…/';
       input.spellcheck = false;
-      input.setAttribute('aria-label', host.name + ' base URL');
+      input.setAttribute('list', 'known-bases');
+      input.setAttribute('aria-label', 'Base URL or whole image URL for this host');
 
       var resolved = el('p', 'host-resolved');
       function refresh() {
-        var url = joinUrl(host.base, state.payload);
-        resolved.textContent = url ? '→ ' + url : '→ no URL set yet';
+        var url = urlForHost(host);
+        if (!url) {
+          resolved.textContent = host.base
+            ? '→ needs an image path below'
+            : '→ no URL set yet';
+        } else if (looksLikeFile(host.base)) {
+          resolved.textContent = '→ ' + url + '  (a whole image URL — the image picker below is not applied to this card)';
+        } else {
+          resolved.textContent = '→ ' + url;
+        }
+        nameInput.placeholder = displayName(host);
+        if (blurb) blurb.hidden = isShipped(host) && host.base !== defaultBaseFor(host.id);
       }
       input.addEventListener('input', function () {
         host.base = input.value;
+        refresh();
+        save();
+      });
+      nameInput.addEventListener('input', function () {
+        host.label = nameInput.value;
         refresh();
         save();
       });
@@ -1051,6 +1858,60 @@
       body.appendChild(resolved);
       card.appendChild(body);
       wrap.appendChild(card);
+    });
+
+    if (!state.hosts.length) {
+      wrap.appendChild(el('p', 'panel-note', 'No hosts. Add one below.'));
+    }
+  }
+
+  function addHost(presetId) {
+    var preset = PRESETS.filter(function (p) { return p.id === presetId; })[0] || PRESETS[PRESETS.length - 1];
+    state.hosts.push({
+      id: uid(),
+      name: preset.name,
+      blurb: preset.blurb,
+      placeholder: preset.placeholder,
+      label: '',
+      base: '',
+      enabled: true
+    });
+    save();
+    renderHosts();
+    // Focus the URL field of the card just added — the only thing to do next.
+    var inputs = $('hosts').querySelectorAll('.host-url');
+    if (inputs.length) inputs[inputs.length - 1].focus();
+  }
+
+  function renderPresetPicker() {
+    var select = $('add-preset');
+    select.innerHTML = '';
+    var head = el('option', null, 'Add a host…');
+    head.value = '';
+    select.appendChild(head);
+    PRESETS.forEach(function (preset) {
+      var option = el('option', null, preset.name);
+      option.value = preset.id;
+      select.appendChild(option);
+    });
+    select.value = '';
+  }
+
+  function renderDatalists() {
+    var bases = $('known-bases');
+    bases.innerHTML = '';
+    state.recentBases.forEach(function (value) {
+      var option = el('option');
+      option.value = value;
+      bases.appendChild(option);
+    });
+
+    var paths = $('known-paths');
+    paths.innerHTML = '';
+    state.recentPaths.forEach(function (value) {
+      var option = el('option');
+      option.value = value;
+      paths.appendChild(option);
     });
   }
 
@@ -1063,6 +1924,7 @@
       select.appendChild(option);
     });
     select.value = state.payload;
+    $('custom-path').value = state.customPath;
     updatePayloadHint();
   }
 
@@ -1086,6 +1948,7 @@
   function updatePayloadHint() {
     var payload = PAYLOADS.filter(function (p) { return p.file === state.payload; })[0];
     $('payload-hint').textContent = payload ? payload.hint : '';
+    $('custom-path').hidden = state.payload !== CUSTOM_PAYLOAD;
   }
 
   function setStatus(text, isError) {
@@ -1094,10 +1957,22 @@
     node.classList.toggle('error', !!isError);
   }
 
+  function readyMessage() {
+    if (!activeHosts().length) {
+      if (state.payload === CUSTOM_PAYLOAD && !payloadFile()) {
+        return 'Type the path of an image inside your buckets, or paste a whole image URL into a host card.';
+      }
+      return 'Paste a base URL — img.yourdomain.com, a bucket endpoint — or a whole image URL into a host card.';
+    }
+    return 'Ready.';
+  }
+
   // ── wiring ──────────────────────────────────────────────────────────
 
   restore();
   renderHosts();
+  renderPresetPicker();
+  renderDatalists();
   renderPayloads();
   renderModes();
   $('runs').value = state.runs;
@@ -1106,6 +1981,14 @@
   $('payload').addEventListener('change', function () {
     state.payload = this.value;
     updatePayloadHint();
+    renderHosts();
+    save();
+    if (state.payload === CUSTOM_PAYLOAD) $('custom-path').focus();
+    setStatus(readyMessage());
+  });
+
+  $('custom-path').addEventListener('input', function () {
+    state.customPath = this.value;
     renderHosts();
     save();
   });
@@ -1130,30 +2013,39 @@
     save();
   });
 
+  $('add-preset').addEventListener('change', function () {
+    if (!this.value) return;
+    addHost(this.value);
+    this.value = '';
+  });
+
   $('run').addEventListener('click', runTest);
+  $('move').addEventListener('click', runMoveCheck);
   $('race').addEventListener('click', runRace);
 
   $('reset').addEventListener('click', function () {
-    try { localStorage.removeItem(STORAGE_KEY); } catch (err) { /* nothing to undo */ }
-    state.hosts = DEFAULT_HOSTS.map(function (h) { return Object.assign({}, h); });
+    try { localStorage.removeItem(STORAGE_KEY); localStorage.removeItem(LEGACY_KEY); } catch (err) { /* nothing to undo */ }
+    state.hosts = freshHosts();
     state.payload = PAYLOADS[1].file;
+    state.customPath = '';
     state.runs = 8;
     state.warmup = true;
     state.mode = 'warm';
+    state.referenceId = DEFAULT_HOSTS[0].id;
+    state.recentBases = [];
+    state.recentPaths = [];
     renderHosts();
+    renderDatalists();
     renderPayloads();
     renderModes();
     $('runs').value = state.runs;
     $('warmup').checked = state.warmup;
     $('results').hidden = true;
+    $('move-panel').hidden = true;
     $('race-panel').hidden = true;
     lastResults = null;
     setStatus('Back to the defaults.');
   });
 
-  if (!state.hosts.some(function (h) { return h.enabled && h.base; })) {
-    setStatus('Paste the base URL of your Backblaze bucket above, then run the test.');
-  } else {
-    setStatus('Ready.');
-  }
+  setStatus(readyMessage());
 })();

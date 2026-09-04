@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GitHub vs Backblaze — image speed test</title>
-<meta name="description" content="Load the same image from GitHub and from Backblaze B2, side by side, and measure which one gets to the browser first.">
+<title>Image host speed test — any image, any bucket</title>
+<meta name="description" content="Load the same image from any set of hosts — a Backblaze bucket, the same bucket behind a Cloudflare img. record, an R2 bucket, the old WordPress site — time each one, and check that a moved file arrived intact.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/style.css">
 </head>
@@ -15,11 +15,13 @@
     <p class="eyebrow">Image hosting benchmark</p>
     <h1>Does it matter where your images live?</h1>
     <p class="lede">
-      This page loads the <strong>same image file</strong> from two or more hosts, one request at a
-      time, and times each one in your browser. Nothing is simulated and nothing is sent anywhere —
-      the measurements are the browser's own
+      Point this page at <strong>any image on any host</strong> — a bucket behind one of your own
+      Cloudflare records, the bucket endpoint underneath it, the old site you are migrating away
+      from — and it loads the same file from each one, one request at a time, timing every one in
+      your browser with the
       <a href="https://developer.mozilla.org/en-US/docs/Web/API/PerformanceResourceTiming" target="_blank" rel="noopener">Resource Timing</a>
-      numbers, taken on your connection, from wherever you happen to be sitting.
+      API. It will also check that a file you have just moved arrived <em>intact</em>. Nothing is
+      simulated and nothing is sent anywhere.
     </p>
   </div>
 </header>
@@ -29,26 +31,38 @@
   <!-- ─────────────────────────── setup ─────────────────────────── -->
   <section class="panel" id="setup">
     <div class="panel-head">
-      <h2>1. The contenders</h2>
+      <h2>1. The places you are testing</h2>
       <p class="panel-note">
-        Each host serves the same file name. Set a base URL per host — the payload picker below
-        appends the file name to it.
+        Give each card a base URL — <code>https://img.yourdomain.com/</code>, a bucket endpoint,
+        anything — and the image path from step 2 is appended to it. Or paste a
+        <strong>whole image URL</strong> into a card and it is used exactly as it stands, which is
+        how you compare one path on the old host against a different path on the new one. Mark one
+        card as <strong>the original</strong>: the move check compares everything else against it.
       </p>
     </div>
     <div class="hosts" id="hosts"><!-- rendered by app.js --></div>
+    <div class="host-actions">
+      <select id="add-preset" aria-label="Add a host"></select>
+      <span class="field-hint">A preset only fills in a name, a description and a placeholder —
+        every card behaves the same way.</span>
+    </div>
+    <datalist id="known-bases"></datalist>
   </section>
 
   <section class="panel" id="controls-panel">
     <div class="panel-head">
-      <h2>2. The test</h2>
+      <h2>2. The image, and the test</h2>
     </div>
 
     <div class="controls">
-      <label class="field">
-        <span class="field-label">Payload</span>
+      <div class="field">
+        <label class="field-label" for="payload">Which image</label>
         <select id="payload"></select>
+        <input type="text" id="custom-path" list="known-paths" spellcheck="false"
+               placeholder="photos/hero.jpg" aria-label="Path to an image inside each host" hidden>
+        <datalist id="known-paths"></datalist>
         <span class="field-hint" id="payload-hint"></span>
-      </label>
+      </div>
 
       <label class="field">
         <span class="field-label">What to measure</span>
@@ -59,8 +73,8 @@
       <label class="field">
         <span class="field-label">Runs per host</span>
         <input type="number" id="runs" min="1" max="40" step="1" value="8">
-        <span class="field-hint">Hosts alternate turn by turn, so a passing wobble in your
-          connection hits both sides equally.</span>
+        <span class="field-hint">The order is reshuffled every run, so a passing wobble in your
+          connection cannot keep landing on the same host.</span>
       </label>
 
       <label class="field field-check">
@@ -73,7 +87,8 @@
       </label>
 
       <div class="actions">
-        <button id="run" class="btn btn-primary" type="button">Run the test</button>
+        <button id="run" class="btn btn-primary" type="button">Run the speed test</button>
+        <button id="move" class="btn" type="button">Check the move</button>
         <button id="race" class="btn" type="button">Visual race</button>
         <button id="reset" class="btn btn-quiet" type="button">Reset</button>
       </div>
@@ -83,10 +98,34 @@
     <div class="progress" id="progress" hidden><div class="progress-bar" id="progress-bar"></div></div>
   </section>
 
+  <!-- ─────────────────────────── move check ─────────────────────────── -->
+  <section class="panel" id="move-panel" hidden>
+    <div class="panel-head">
+      <h2>Did the move work?</h2>
+      <p class="panel-note">
+        One request per host, read carefully rather than quickly: the bytes themselves compared
+        against the card you marked as the original, plus the things that quietly break when images
+        are copied from one service to another — the content type, the cache headers, the pixel
+        dimensions, and whether a browser on your own site is even allowed to read the file.
+      </p>
+    </div>
+
+    <div class="verdict" id="move-verdict"></div>
+
+    <h3 class="sub">What each host is serving</h3>
+    <div class="table-scroll">
+      <table class="grid" id="move-table"></table>
+    </div>
+    <p class="panel-note" id="move-digest-note"></p>
+
+    <h3 class="sub">Host by host</h3>
+    <div id="move-notes"></div>
+  </section>
+
   <!-- ─────────────────────────── results ─────────────────────────── -->
   <section class="panel" id="results" hidden>
     <div class="panel-head">
-      <h2>3. The result</h2>
+      <h2>The result</h2>
     </div>
 
     <div class="verdict" id="verdict"></div>
@@ -114,8 +153,9 @@
     <div class="panel-head">
       <h2>Visual race</h2>
       <p class="panel-note">
-        Both requests fire at the same moment and share your bandwidth, so the times are slower than
-        the measured test above. This one is for watching, not for citing.
+        Every request fires at the same moment and they share your bandwidth, so the times are
+        slower than the measured test above. This one is for watching — and for seeing at a glance
+        that a URL resolves to the image you meant — not for citing.
       </p>
     </div>
     <div class="race" id="race-track"></div>
@@ -128,8 +168,73 @@
     <p>
       A single run tells you very little. Networks are noisy, and the first request to a host pays
       for a DNS lookup, a TCP handshake and a TLS negotiation that later requests reuse. That is why
-      this page runs several times, alternates between hosts, and reports the <strong>median</strong>
-      rather than the average — one unlucky run cannot drag the median around the way it drags a mean.
+      this page runs several times, reshuffles the order each time, and reports the
+      <strong>median</strong> rather than the average — one unlucky run cannot drag the median
+      around the way it drags a mean.
+    </p>
+
+    <h3>Testing one of your own buckets</h3>
+
+    <p>
+      A card takes anything that answers over HTTP. For the <code>img.yourdomain.com</code>
+      arrangement — a proxied CNAME to the bucket, a URL-rewrite rule that prepends the bucket name
+      to the path, and a response-header rule adding <code>Timing-Allow-Origin</code> — paste
+      <code>https://img.yourdomain.com/</code> as the base and put the object's key in the image
+      field. Paste the bucket's own endpoint into a second card and you are measuring exactly what
+      the Cloudflare record in front of it is buying you.
+    </p>
+
+    <p>
+      <strong>One host on its own is a legitimate test.</strong> If you have just brought up a new
+      <code>img.</code> record and only want to know how fast it is, tick one card and run it. The
+      page reports the median, the spread, and whether that hostname permits cross-origin reads and
+      sends <code>Timing-Allow-Origin</code> — which happens to be the quickest way to tell whether
+      the response-header rule is really scoped to that hostname. What it will not do is invent a
+      winner, because there is nobody to beat.
+    </p>
+
+    <h3>Moving an image from one service to another</h3>
+
+    <p>
+      Speed is the second question. The first is whether the file that arrived is the file you sent.
+      <strong>Check the move</strong> fetches the image once from every host, compares the bytes
+      against whichever card you marked as <em>the original</em>, and reports what is different.
+      What it catches, in rough order of how often it actually happens:
+    </p>
+
+    <ul>
+      <li>
+        <strong>The wrong content type.</strong> A copy made with a tool that did not set one lands
+        as <code>application/octet-stream</code> or <code>binary/octet-stream</code>. The image
+        still downloads, so a quick eyeball test passes — but browsers may save it instead of
+        showing it, and CDN image optimisation will skip it.
+      </li>
+      <li>
+        <strong>A file that is not the same file.</strong> Something in the pipeline re-encoded or
+        resized it. The byte comparison and the pixel dimensions both catch this; a digest of each
+        copy is shown so you can record it.
+      </li>
+      <li>
+        <strong>Missing cache headers.</strong> An object uploaded without
+        <code>Cache-Control</code> is re-fetched far more often than it should be, and the CDN in
+        front of it cannot do its job. Images that never change are normally set to a year, and
+        marked <code>immutable</code>.
+      </li>
+      <li>
+        <strong>Missing CORS or timing headers.</strong> If the new host refuses cross-origin reads,
+        scripts on your own site cannot fetch the image, and this page cannot verify anything about
+        it either. If it merely omits <code>Timing-Allow-Origin</code>, you lose the phase
+        breakdown — for a Cloudflare-fronted bucket both are one response-header rule.
+      </li>
+      <li>
+        <strong>A path that does not exist.</strong> The most common one of all, and it shows up as
+        a failed request rather than a slow one.
+      </li>
+    </ul>
+
+    <p>
+      The move check requests every URL with a cache-busting token, so it describes what the host is
+      holding <em>now</em> rather than what an edge cached before you replaced the file.
     </p>
 
     <h3>The two modes measure genuinely different things</h3>
@@ -172,10 +277,10 @@
       It also proves the hosts served the same file. Where a cross-origin read is permitted, the byte
       count is taken from the response body itself rather than from a header, so a host quietly
       serving a smaller or re-encoded image is caught and the comparison is flagged as not
-      like-for-like.
+      like-for-like. When that fires, the move check will tell you exactly how the two files differ.
     </p>
 
-    <h3>Why the two hosts are not really the same kind of thing</h3>
+    <h3>Some hosts are not the same kind of thing</h3>
     <ul>
       <li>
         <strong>raw.githubusercontent.com</strong> is a convenience endpoint for reading files out of
@@ -185,37 +290,45 @@
       </li>
       <li>
         <strong>GitHub Pages</strong> (<code>username.github.io</code>) is a real static host with a
-        CDN in front of it. If you want the GitHub side of this comparison to be a fair fight, this
-        is the URL to use, not the raw one.
+        CDN in front of it. If you want the GitHub side of a comparison to be a fair fight, this is
+        the URL to use, not the raw one.
       </li>
       <li>
         <strong>Backblaze B2</strong> is object storage. Hitting the bucket endpoint directly
-        (<code>f00x.backblazeb2.com</code>) means going to one region every time, from anywhere in the
-        world. Putting Cloudflare in front of it — the <code>img.yourdomain.com</code> arrangement —
-        adds a cache at the edge and, through the Bandwidth Alliance, makes egress free. That is
-        where B2 starts to look good on both speed and the bill.
+        (<code>f00x.backblazeb2.com</code>, or the S3-style address) means going to one region every
+        time, from anywhere in the world. Putting Cloudflare in front of it — the
+        <code>img.yourdomain.com</code> arrangement — adds a cache at the edge and, through the
+        Bandwidth Alliance, makes egress free. That is where B2 starts to look good on both speed and
+        the bill.
       </li>
     </ul>
 
     <p>
-      So the interesting comparison is usually not "GitHub or Backblaze" but
-      <em>"is there a CDN in front of it, and how far is the origin from the visitor"</em>. All three
-      are filled in above — raw GitHub, direct B2, and the same B2 bucket behind Cloudflare — and the
-      shape of the answer usually appears in the first eight runs. The third one is the arrangement
-      worth copying; the gap between it and the second is what the CDN is buying you.
+      So the interesting comparison is usually not "this provider or that one" but
+      <em>"is there a CDN in front of it, and how far is the origin from the visitor"</em>. The three
+      cards the page ships with are exactly that experiment — raw GitHub, direct B2, and the same B2
+      bucket behind Cloudflare — and the shape of the answer usually appears in the first eight runs.
+      Replace them all with your own the moment you have something real to test.
     </p>
 
     <h3>Things this page cannot see</h3>
     <ul>
       <li>
         Cross-origin hosts only expose a phase-by-phase breakdown (DNS, connect, TLS, waiting,
-        downloading) if they send a <code>Timing-Allow-Origin</code> header. Where a host does not,
-        the table falls back to the total, and says so.
+        downloading) — and the protocol they answered over — if they send a
+        <code>Timing-Allow-Origin</code> header. Where a host does not, the table falls back to the
+        total, and says so.
       </li>
       <li>
-        Transferred byte counts have the same restriction. If a size reads as unknown, check that the
-        two hosts really are serving the same file before trusting the comparison — one of them may
-        be re-encoding or resizing it.
+        The move check reads the content type, size, cache and last-modified headers on any host that
+        permits a cross-origin read, because those few are readable by default. Anything else, such
+        as <code>cf-cache-status</code> or <code>etag</code>, needs the host to name it in an
+        <code>Access-Control-Expose-Headers</code> response header, and reads as missing otherwise.
+      </li>
+      <li>
+        Nothing here can list what is <em>in</em> a bucket. Public object storage will serve you an
+        object you name but will not enumerate its contents to an anonymous browser, so you have to
+        supply the path. The page remembers the ones you have used.
       </li>
       <li>
         Your result is your result: your city, your ISP, your Wi-Fi, this minute. It is evidence

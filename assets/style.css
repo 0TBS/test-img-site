@@ -18,6 +18,11 @@
   --host-1: #2f6fd0;
   --host-2: #d4762a;
   --host-3: #4f9d69;
+  --host-4: #8a5cd0;
+  --host-5: #c2405f;
+  --host-6: #2d9aa8;
+  --host-7: #94781f;
+  --host-8: #5b6b7d;
 
   --radius: 12px;
   --shadow: 0 1px 2px rgb(20 24 31 / 6%), 0 8px 24px rgb(20 24 31 / 5%);
@@ -44,6 +49,11 @@
     --host-1: #6fa4f0;
     --host-2: #e8a25c;
     --host-3: #6fc98f;
+    --host-4: #b393ee;
+    --host-5: #ef7f9b;
+    --host-6: #5cc6d4;
+    --host-7: #ccae4d;
+    --host-8: #9aa8b8;
 
     --shadow: 0 1px 2px rgb(0 0 0 / 30%), 0 8px 24px rgb(0 0 0 / 22%);
   }
@@ -138,17 +148,55 @@ code {
 .host input[type="checkbox"] { margin: 6px 0 0; accent-color: var(--host); }
 
 .host-body { min-width: 0; display: grid; gap: 8px; }
-.host-name {
+.host-top {
   display: flex;
   flex-wrap: wrap;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
-  font-weight: 640;
 }
-.host-name .dot {
+.host-top .dot {
   width: 9px; height: 9px; border-radius: 50%;
-  background: var(--host); flex: none; align-self: center;
+  background: var(--host); flex: none;
 }
+.host-name-input {
+  flex: 1 1 160px;
+  min-width: 0;
+  font: 640 14px var(--sans);
+  padding: 5px 8px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: none;
+  color: var(--ink);
+}
+.host-name-input:hover { border-color: var(--line-2); }
+.host-name-input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; background: var(--surface); }
+.host-name-input::placeholder { color: var(--ink); opacity: 1; }
+
+.host-ref {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  font-size: 12.5px;
+  color: var(--ink-2);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.host-ref input { margin: 0; accent-color: var(--host); }
+
+.host-remove {
+  flex: none;
+  width: 26px; height: 26px;
+  padding: 0;
+  font: 16px/1 var(--sans);
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: none;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+.host-remove:hover { border-color: var(--line-2); color: var(--bad); }
+
 .host-blurb { color: var(--ink-2); font-size: 13px; }
 .host-url {
   width: 100%;
@@ -167,6 +215,23 @@ code {
   overflow-wrap: anywhere;
 }
 
+.host-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 14px;
+  margin-top: 14px;
+}
+.host-actions select {
+  font: 14px var(--sans);
+  padding: 9px 11px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+}
+.host-actions .field-hint { flex: 1 1 260px; }
+
 /* ── controls ───────────────────────────────────────────────────────── */
 
 .controls {
@@ -179,7 +244,7 @@ code {
 .field { display: grid; gap: 6px; align-content: start; }
 .field-label { font-size: 13px; font-weight: 640; }
 .field-hint { color: var(--ink-3); font-size: 12.5px; line-height: 1.45; }
-.field select, .field input[type="number"] {
+.field select, .field input[type="number"], .field input[type="text"] {
   font: 14px var(--sans);
   padding: 9px 11px;
   border: 1px solid var(--line-2);
@@ -189,6 +254,8 @@ code {
   width: 100%;
   max-width: 260px;
 }
+#custom-path { font: 13px var(--mono); }
+#custom-path::placeholder { color: var(--ink-3); }
 .field-check { grid-template-columns: auto 1fr; gap: 10px; align-items: start; }
 .field-check input { margin-top: 3px; accent-color: var(--accent); }
 .field-check > span { display: grid; gap: 4px; }
@@ -287,6 +354,66 @@ code {
 .grid .host-cell .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--host); }
 .grid .best { color: var(--good); font-weight: 640; }
 .grid .miss { color: var(--ink-3); }
+.grid .digest { font: 12.5px var(--mono); color: var(--ink-2); }
+/* A long Cache-Control value is the one cell that would otherwise push this
+   table off the side of the page on a laptop. */
+.grid .wrap-cell { white-space: normal; min-width: 11ch; max-width: 20ch; }
+
+/* ── move check ─────────────────────────────────────────────────────── */
+
+.badge {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line-2);
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font-size: 12px;
+  font-weight: 640;
+  letter-spacing: 0.01em;
+}
+.badge.good { border-color: var(--good); color: var(--good); }
+.badge.warn { border-color: var(--warn); color: var(--warn); }
+.badge.bad  { border-color: var(--bad);  color: var(--bad); }
+
+.note-group {
+  border-left: 3px solid var(--host);
+  padding: 2px 0 2px 14px;
+  margin-bottom: 18px;
+}
+.note-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 6px;
+  font-weight: 640;
+  font-size: 14px;
+}
+.note-title .dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: var(--host); flex: none; align-self: center;
+}
+.note-url { font: 12px var(--mono); color: var(--ink-3); overflow-wrap: anywhere; }
+.note-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 6px; }
+.note {
+  position: relative;
+  padding-left: 20px;
+  font-size: 13.5px;
+  color: var(--ink-2);
+  max-width: 76ch;
+}
+.note::before {
+  position: absolute;
+  left: 0;
+  font-weight: 700;
+}
+.note.good { color: var(--good); }
+.note.good::before { content: "✓"; }
+.note.warn { color: var(--warn); }
+.note.warn::before { content: "!"; }
+.note.bad { color: var(--bad); }
+.note.bad::before { content: "×"; }
 
 /* ── run chart ──────────────────────────────────────────────────────── */
 
