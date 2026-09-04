@@ -51,6 +51,12 @@
       </label>
 
       <label class="field">
+        <span class="field-label">What to measure</span>
+        <select id="mode"></select>
+        <span class="field-hint" id="mode-hint"></span>
+      </label>
+
+      <label class="field">
         <span class="field-label">Runs per host</span>
         <input type="number" id="runs" min="1" max="40" step="1" value="8">
         <span class="field-hint">Hosts alternate turn by turn, so a passing wobble in your
@@ -126,12 +132,47 @@
       rather than the average — one unlucky run cannot drag the median around the way it drags a mean.
     </p>
 
+    <h3>The two modes measure genuinely different things</h3>
+
     <p>
-      Every request carries a unique <code>?cb=</code> value, so nothing is answered from your browser
-      cache. That also means each request is a fresh miss at the CDN edge, which is the honest
-      comparison: it measures how quickly each host can produce a file it is not already holding
-      close to you. Real visitors will often do better than these numbers on a host with a CDN in
-      front of it, because the second visitor from their city gets a cached copy.
+      <strong>Repeat visitor</strong> is the default, and the one that answers "where should my
+      images live". Each request goes to a stable URL with only the <em>browser</em> cache bypassed,
+      so a host with a CDN in front of it answers from its edge — which is what almost every real
+      visitor gets, because someone near them has usually fetched the file already. This is the mode
+      in which a CDN is allowed to show what it is for.
+    </p>
+
+    <p>
+      <strong>First visitor</strong> adds a unique <code>?cb=</code> token to every URL. That misses
+      the browser cache and the CDN edge alike, so each request travels all the way to the origin. It
+      is the honest worst case, and it is the right mode for asking how quickly a host can produce a
+      file it is <em>not</em> already holding near you — but reading it as the everyday number
+      understates any host with a cache in front of it.
+    </p>
+
+    <p>
+      Repeat-visitor mode needs every host to permit a cross-origin read, because it is the only way
+      to bypass the browser cache without changing the URL. If any one host refuses, the page says so
+      and drops <em>all</em> hosts back to first-visitor mode — measuring two hosts by different
+      methods would be worse than measuring them both pessimistically.
+    </p>
+
+    <h3>Whether the difference is real</h3>
+
+    <p>
+      A ratio on its own is not a result. If the run-to-run spread is wider than the gap being
+      claimed, the ranking is noise dressed up as a finding. The page runs a
+      <a href="https://en.wikipedia.org/wiki/Mann%E2%80%93Whitney_U_test" target="_blank" rel="noopener">Mann–Whitney U test</a>
+      on the two fastest hosts' samples — a rank test, because latencies are skewed and the samples
+      are small — and says plainly whether the ordering survives. When it does not, the headline
+      reads <em>Too close to call</em> rather than inventing a winner.
+    </p>
+
+    <p>
+      It also proves the hosts served the same file. Where a cross-origin read is permitted, the byte
+      count is taken from the response body itself rather than from a header, so a host quietly
+      serving a smaller or re-encoded image is caught and the comparison is flagged as not
+      like-for-like.
     </p>
 
     <h3>Why the two hosts are not really the same kind of thing</h3>

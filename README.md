@@ -20,11 +20,24 @@ tools/make-samples.py regenerates the sample images
   network does not land consistently on one side.
 - Requests are **sequential**, never parallel — two images racing for the same bandwidth measure the
   bandwidth, not the hosts.
-- Every URL carries a unique `?cb=` token, so nothing comes from the browser cache and every request
-  is a fresh miss at the CDN edge.
+- Two modes, because they answer different questions. **Repeat visitor** (the default) uses stable
+  URLs with `fetch(..., {cache: 'no-store'})`, bypassing the browser cache while leaving a CDN edge
+  cache warm — what nearly every real visitor experiences. **First visitor** adds a unique `?cb=`
+  token so each request misses the browser cache *and* the edge and goes to the origin.
+- Every host in a run is measured **the same way**. Repeat-visitor mode needs cross-origin reads; if
+  any one host refuses, all hosts fall back to `<img>` loads with cache-busting, and the page says so
+  rather than quietly mixing methods.
+- Byte counts are read **from the response body**, not from a header, so the page can prove the hosts
+  served identical files even when they send no `Timing-Allow-Origin`. A mismatch is reported as a
+  broken comparison.
 - There is an optional untimed **warm-up** request per host, so DNS, TCP and TLS are already paid for
-  by the time the clock starts. Turn it off to measure a cold visitor's very first image instead.
-- The headline number is the **median**, not the mean, so one unlucky run cannot move it far.
+  by the time the clock starts — and in repeat-visitor mode it primes the CDN edge too.
+- The headline number is the **median**, not the mean, so one unlucky run cannot move it far, and a
+  **Mann–Whitney U test** decides whether the gap survives the run-to-run noise. If it does not, the
+  verdict says *Too close to call* instead of naming a winner.
+- Each request reads **its own** resource-timing entry. Repeat-visitor mode reuses one URL per host,
+  so entries accumulate under a single name; the page records how many existed before a request and
+  ignores anything older, rather than re-reporting the previous run's number.
 
 Where a host sends a `Timing-Allow-Origin` header, the page also breaks the time down into DNS,
 connect + TLS, waiting (TTFB) and downloading, and reports the transferred byte count. Where it does

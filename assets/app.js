@@ -16,8 +16,11 @@
   var GITHUB_RAW = 'https://raw.githubusercontent.com/0tbs/test-img-site/main/assets/';
 
   // The bucket endpoint holding the same three sample files. Public, in the
-  // us-east-005 region.
-  var B2_DIRECT = 'https://f005.backblazeb2.com/file/brandingcentres-imgsite-test/speed-test/';
+  // us-east-005 region. This is the S3-style address rather than the native
+  // /file/<bucket>/ one because B2 applies bucket CORS rules to the S3
+  // endpoint, and without cross-origin permission this host could only be
+  // measured by the cruder of the two methods below.
+  var B2_DIRECT = 'https://brandingcentres-imgsite-test.s3.us-east-005.backblazeb2.com/speed-test/';
 
   // The same bucket reached through Cloudflare: a proxied CNAME, a transform
   // rule that prepends the bucket to the path, and a response-header rule.
@@ -35,7 +38,7 @@
     {
       id: 'b2direct',
       name: 'Backblaze B2 (direct)',
-      blurb: 'The bucket endpoint with nothing in front of it: every request travels to the one region the bucket lives in, over HTTP/1.1, with no Timing-Allow-Origin header — so this host will only report totals.',
+      blurb: 'The bucket endpoint with nothing in front of it: every request travels to the one region the bucket lives in, over HTTP/1.1. It sends no Timing-Allow-Origin, so it reports a total but no phase breakdown.',
       base: B2_DIRECT,
       enabled: true
     },
@@ -55,7 +58,22 @@
   ];
 
   var TIMEOUT_MS = 20000;
-  var GAP_MS = 120; // breathing room between requests so they never overlap
+  var FAILED_TIMEOUT_MS = 4000; // short leash once a host has already failed
+  var GIVE_UP_AFTER = 2;        // consecutive failures before a host is dropped
+  var GAP_MS = 120;             // breathing room so requests never overlap
+
+  var MODES = [
+    {
+      id: 'warm',
+      label: 'Repeat visitor — CDN edge warm',
+      hint: 'Requests a stable URL and bypasses only the browser cache, so a CDN in front of a host answers from its edge. This is what most real visitors experience, and it is the mode that shows what a CDN is worth. Needs every host to allow cross-origin reads.'
+    },
+    {
+      id: 'cold',
+      label: 'First visitor — nothing cached anywhere',
+      hint: 'Adds a unique token to every URL, so each request misses the browser cache and the CDN edge alike, and travels all the way to the origin. Measures the worst case each host can offer rather than the common one.'
+    }
+  ];
 
   // ── small helpers ───────────────────────────────────────────────────
 
@@ -117,6 +135,11 @@
     return url + (url.indexOf('?') === -1 ? '?' : '&') + 'cb=' + token;
   }
 
+  function formatP(p) {
+    if (p < 0.001) return '0.001 or less';
+    return p.toFixed(p < 0.01 ? 4 : 3);
+  }
+
   function hostLabel(url) {
     try { return new URL(url).host; } catch (err) { return url; }
   }
@@ -127,7 +150,8 @@
     hosts: DEFAULT_HOSTS.map(function (h) { return Object.assign({}, h); }),
     payload: PAYLOADS[1].file,
     runs: 8,
-    warmup: true
+    warmup: true,
+    mode: 'warm'
   };
 
   function defaultBaseFor(id) {
@@ -147,7 +171,8 @@
         }),
         payload: state.payload,
         runs: state.runs,
-        warmup: state.warmup
+        warmup: state.warmup,
+        mode: state.mode
       }));
     } catch (err) { /* private browsing, blocked storage — not worth reporting */ }
   }
@@ -175,15 +200,66 @@
     if (PAYLOADS.some(function (p) { return p.file === saved.payload; })) state.payload = saved.payload;
     if (saved.runs >= 1 && saved.runs <= 40) state.runs = Math.round(saved.runs);
     if (typeof saved.warmup === 'boolean') state.warmup = saved.warmup;
+    if (MODES.some(function (m) { return m.id === saved.mode; })) state.mode = saved.mode;
   }
 
   // ── measurement ─────────────────────────────────────────────────────
 
-  // Resolve once the image is fully loaded (or has failed), then read the
-  // browser's own timing entry for that exact URL.
-  function timeImage(url) {
+  // Can this host be read cross-origin? Only then can a request be timed with
+  // fetch, which is what makes warm-cache mode and exact byte counts possible.
+  function probeCors(url) {
+    return fetch(bust(url), { mode: 'cors', cache: 'no-store' })
+      .then(function (response) { return response.ok; })
+      .catch(function () { return false; });
+  }
+
+  // Time one request. Two methods, and every host in a run uses the same one:
+  //
+  //   fetch  — reads the body to completion, so the clock covers the whole
+  //            transfer and the exact byte count is known for every host.
+  //            cache: 'no-store' bypasses the browser cache without changing
+  //            the URL, which is what leaves a CDN edge cache warm.
+  //   image  — the fallback where a host forbids cross-origin reads. An <img>
+  //            can load anything, but the bytes are only visible when the host
+  //            sends Timing-Allow-Origin, and the URL must be cache-busted.
+  function measure(url, method, timeoutMs) {
+    return method === 'fetch' ? measureFetch(url, timeoutMs) : measureImage(url, timeoutMs);
+  }
+
+  function measureFetch(url, timeoutMs) {
+    // Warm mode requests the same URL every run, so entries pile up under one
+    // name. Remember the count now and read only past it, or a run whose entry
+    // has not landed yet would silently report the previous run's timing.
+    var seen = performance.getEntriesByName(url).length;
+    var started = performance.now();
+    var controller = typeof AbortController === 'function' ? new AbortController() : null;
+    var timer = setTimeout(function () { if (controller) controller.abort(); }, timeoutMs);
+
+    var options = { mode: 'cors', cache: 'no-store' };
+    if (controller) options.signal = controller.signal;
+
+    return fetch(url, options)
+      .then(function (response) {
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        // Draining the body is the point: the request is not finished until
+        // the last byte has arrived.
+        return response.arrayBuffer();
+      })
+      .then(function (buffer) {
+        clearTimeout(timer);
+        var wall = performance.now() - started;
+        return settle(url, true, wall, buffer.byteLength, seen);
+      })
+      .catch(function () {
+        clearTimeout(timer);
+        return settle(url, false, performance.now() - started, null, seen);
+      });
+  }
+
+  function measureImage(url, timeoutMs) {
     return new Promise(function (resolve) {
       var img = new Image();
+      var seen = performance.getEntriesByName(url).length;
       var started = performance.now();
       var settled = false;
 
@@ -191,31 +267,40 @@
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        var wall = performance.now() - started;
-        // The timing entry lands when the fetch completes, which can be a beat
-        // after onload; give the queue one turn before reading it.
-        setTimeout(function () { resolve(describe(url, ok, wall)); }, 0);
+        resolve(settle(url, ok, performance.now() - started, null, seen));
       }
 
-      var timer = setTimeout(function () { img.src = ''; finish(false); }, TIMEOUT_MS);
+      var timer = setTimeout(function () { img.src = ''; finish(false); }, timeoutMs);
       img.onload = function () { finish(true); };
       img.onerror = function () { finish(false); };
       img.src = url;
     });
   }
 
-  function describe(url, ok, wall) {
+  // The resource timing entry lands when the transfer completes, which can be
+  // a beat after the promise settles. Give the queue one turn before reading.
+  function settle(url, ok, wall, measuredBytes, seen) {
+    return new Promise(function (resolve) {
+      setTimeout(function () { resolve(describe(url, ok, wall, measuredBytes, seen)); }, 0);
+    });
+  }
+
+  function describe(url, ok, wall, measuredBytes, seen) {
     var result = {
       ok: ok,
       total: wall,
       detailed: false,
       dns: null, connect: null, tls: null, wait: null, download: null,
-      bytes: null
+      bytes: measuredBytes,
+      measuredBytes: measuredBytes
     };
     if (!ok) { result.total = null; return result; }
 
+    // Only an entry recorded after this request started describes this
+    // request. If none arrived, keep the wall-clock reading rather than
+    // attributing an older entry to this run.
     var entries = performance.getEntriesByName(url);
-    var entry = entries.length ? entries[entries.length - 1] : null;
+    var entry = entries.length > seen ? entries[entries.length - 1] : null;
     if (!entry) return result;
 
     result.total = entry.duration || wall;
@@ -230,16 +315,67 @@
       result.wait = entry.responseStart - entry.requestStart;
       result.download = entry.responseEnd - entry.responseStart;
     }
-    if (entry.encodedBodySize > 0) result.bytes = entry.encodedBodySize;
-    else if (entry.transferSize > 0) result.bytes = entry.transferSize;
+    // A byte count read from the body itself is authoritative; the timing
+    // entry's figures are only exposed to same-origin or Timing-Allow-Origin
+    // hosts, so they are the fallback, not the source of truth.
+    if (result.bytes == null) {
+      if (entry.encodedBodySize > 0) result.bytes = entry.encodedBodySize;
+      else if (entry.transferSize > 0) result.bytes = entry.transferSize;
+    }
 
     return result;
+  }
+
+  // Mann-Whitney U, two-sided, with the normal approximation and a continuity
+  // correction. Latency samples are skewed and small, so a rank test is the
+  // honest way to ask whether two hosts really differ or the gap is noise.
+  function differenceIsReal(a, b) {
+    if (a.length < 4 || b.length < 4) return null;
+
+    var pooled = a.map(function (v) { return { v: v, group: 0 }; })
+      .concat(b.map(function (v) { return { v: v, group: 1 }; }))
+      .sort(function (x, y) { return x.v - y.v; });
+
+    // Average ranks over ties, or equal timings would bias the result.
+    var ranks = new Array(pooled.length);
+    for (var i = 0; i < pooled.length;) {
+      var j = i;
+      while (j + 1 < pooled.length && pooled[j + 1].v === pooled[i].v) j++;
+      var shared = (i + j) / 2 + 1;
+      for (var k = i; k <= j; k++) ranks[k] = shared;
+      i = j + 1;
+    }
+
+    var rankSumA = 0;
+    for (var m = 0; m < pooled.length; m++) if (pooled[m].group === 0) rankSumA += ranks[m];
+
+    var na = a.length, nb = b.length;
+    var uA = rankSumA - na * (na + 1) / 2;
+    var u = Math.min(uA, na * nb - uA);
+
+    var meanU = na * nb / 2;
+    var sdU = Math.sqrt(na * nb * (na + nb + 1) / 12);
+    if (!sdU) return null;
+
+    var z = (Math.abs(u - meanU) - 0.5) / sdU;
+    return { p: 2 * (1 - normalCdf(z)), z: z };
+  }
+
+  // Abramowitz & Stegun 26.2.17 — plenty of precision for a p-value we only
+  // ever report to one significant figure.
+  function normalCdf(z) {
+    var t = 1 / (1 + 0.2316419 * Math.abs(z));
+    var d = 0.3989422804014327 * Math.exp(-z * z / 2);
+    var p = d * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 +
+            t * (-1.821255978 + t * 1.330274429))));
+    return z > 0 ? 1 - p : p;
   }
 
   // ── the test ────────────────────────────────────────────────────────
 
   var running = false;
   var lastResults = null;
+  var lastMeta = null;
 
   function activeHosts() {
     return state.hosts.filter(function (h) {
@@ -270,9 +406,33 @@
         colour: 'var(--host-' + ((index % 3) + 1) + ')',
         url: joinUrl(host.base, state.payload),
         samples: [],
-        failures: 0
+        failures: 0,
+        abandoned: false
       };
     });
+
+    // Every host must be measured the same way or the comparison is worthless,
+    // so one host refusing cross-origin reads drops all of them to <img>.
+    setStatus('Checking what each host allows…');
+    var corsResults = await Promise.all(results.map(function (r) { return probeCors(r.url); }));
+    var method = corsResults.every(Boolean) ? 'fetch' : 'image';
+    var blockedBy = results.filter(function (r, i) { return !corsResults[i]; })
+      .map(function (r) { return hostLabel(r.url); });
+
+    // Warm mode needs a stable URL, which only fetch can request without the
+    // browser answering it out of its own cache.
+    var mode = state.mode === 'warm' && method === 'fetch' ? 'warm' : 'cold';
+    var urlFor = function (base) { return mode === 'warm' ? base : bust(base); };
+
+    var run_meta = {
+      method: method,
+      mode: mode,
+      requestedMode: state.mode,
+      blockedBy: blockedBy,
+      payload: state.payload,
+      runs: state.runs,
+      warmup: state.warmup
+    };
 
     var total = state.runs * results.length + (state.warmup ? results.length : 0);
     var done = 0;
@@ -283,8 +443,10 @@
 
     if (state.warmup) {
       for (var w = 0; w < results.length; w++) {
-        setStatus('Warming the connection to ' + hostLabel(results[w].url) + '…');
-        await timeImage(bust(results[w].url));
+        setStatus('Warming ' + hostLabel(results[w].url) + '…');
+        // In warm mode this also primes the CDN edge, which is the whole point:
+        // it is what a visitor arriving after somebody else in their city sees.
+        await measure(urlFor(results[w].url), method, TIMEOUT_MS);
         tick();
         await sleep(GAP_MS);
       }
@@ -298,10 +460,21 @@
 
       for (var i = 0; i < order.length; i++) {
         var target = order[i];
+        if (target.abandoned) { tick(); continue; }
+
         setStatus('Run ' + (run + 1) + ' of ' + state.runs + ' — ' + hostLabel(target.url) + '…');
-        var measurement = await timeImage(bust(target.url));
-        if (measurement.ok) target.samples.push(measurement);
-        else target.failures += 1;
+        // A host that has already failed gets a short leash. Waiting the full
+        // timeout on every remaining run turns one dead host into minutes of
+        // staring at a progress bar.
+        var budget = target.failures ? FAILED_TIMEOUT_MS : TIMEOUT_MS;
+        var measurement = await measure(urlFor(target.url), method, budget);
+
+        if (measurement.ok) {
+          target.samples.push(measurement);
+        } else {
+          target.failures += 1;
+          if (target.failures >= GIVE_UP_AFTER && !target.samples.length) target.abandoned = true;
+        }
         tick();
         await sleep(GAP_MS);
       }
@@ -326,31 +499,37 @@
       };
       var sizes = r.samples.map(function (s) { return s.bytes; }).filter(Boolean);
       r.bytes = sizes.length ? median(sizes) : null;
+      // Bytes read off the body are proof; bytes inferred from a timing entry
+      // are only available to hosts that opt in. The distinction decides
+      // whether the fairness check below can be trusted.
+      r.bytesMeasured = r.samples.some(function (s) { return s.measuredBytes != null; });
     });
 
     lastResults = results;
+    lastMeta = run_meta;
     running = false;
     $('run').disabled = false;
     $('race').disabled = false;
     $('progress').hidden = true;
     $('progress-bar').style.width = '0';
-    setStatus('Done — ' + state.runs + ' runs per host on ' + state.payload + '.');
-    renderResults(results);
+    setStatus('Done — ' + state.runs + ' runs per host on ' + state.payload
+      + ' (' + (run_meta.mode === 'warm' ? 'repeat visitor' : 'first visitor') + ').');
+    renderResults(results, run_meta);
     $('results').scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
   // ── rendering: results ──────────────────────────────────────────────
 
-  function renderResults(results) {
+  function renderResults(results, meta) {
     $('results').hidden = false;
-    renderVerdict(results);
+    renderVerdict(results, meta);
     renderBars(results);
     renderPhases(results);
     renderRunChart(results);
     renderRunsTable(results);
   }
 
-  function renderVerdict(results) {
+  function renderVerdict(results, meta) {
     var box = $('verdict');
     box.innerHTML = '';
 
@@ -368,9 +547,19 @@
     var ratio = loser.stats.median / winner.stats.median;
     var delta = loser.stats.median - winner.stats.median;
 
+    // Does the gap survive the noise? A ratio means nothing on its own when
+    // the run-to-run spread is wider than the difference being claimed.
+    var test = differenceIsReal(
+      winner.samples.map(function (s) { return s.total; }),
+      ranked[1].samples.map(function (s) { return s.total; })
+    );
+    var separated = test ? test.p < 0.05 : ratio >= 1.25;
+
     var headline;
-    if (ratio < 1.1) {
-      headline = 'It is close to a tie.';
+    if (!separated) {
+      headline = 'Too close to call.';
+    } else if (ratio < 1.1) {
+      headline = winner.host.name + ' edged it.';
     } else {
       headline = winner.host.name + ' won, by ' + ratio.toFixed(1) + '×.';
     }
@@ -385,18 +574,55 @@
       'practice because browsers fetch several at once.';
     box.appendChild(detail);
 
+    // Say plainly what was measured. The same three hosts give very different
+    // answers cold and warm, and a reader who does not know which they are
+    // looking at cannot use the number.
+    var how = el('p', 'verdict-detail');
+    how.textContent = meta.mode === 'warm'
+      ? 'Measured as a repeat visitor: stable URLs with the browser cache bypassed, so any host with a CDN in front of it answered from its edge.'
+      : 'Measured as a first visitor: every URL uniquely cache-busted, so each request missed the browser cache and any CDN edge and went to the origin.';
+    if (meta.method === 'image') {
+      how.textContent += ' Timed by image load rather than fetch, because '
+        + meta.blockedBy.join(' and ') + ' would not permit a cross-origin read.';
+    }
+    box.appendChild(how);
+
+    var stat = el('p', 'verdict-detail');
+    if (test) {
+      stat.textContent = separated
+        ? 'The gap against ' + ranked[1].host.name + ' holds up against the run-to-run noise (Mann-Whitney p ≈ '
+          + formatP(test.p) + ' over ' + winner.stats.n + ' and ' + ranked[1].stats.n + ' runs).'
+        : 'The spread between runs is wide enough that this ordering could be noise (Mann-Whitney p ≈ '
+          + formatP(test.p) + '). Treat the ranking as unproven and run it again, or raise the run count.';
+    } else {
+      stat.textContent = 'Too few runs to test whether the gap is real rather than noise — four per host is the minimum.';
+    }
+    box.appendChild(stat);
+
     var caveats = [];
+
+    // Fairness first: a speed comparison between hosts serving different bytes
+    // is not a comparison at all.
     var sizes = finished.map(function (r) { return r.bytes; }).filter(Boolean);
+    var allProven = finished.every(function (r) { return r.bytesMeasured; });
     if (sizes.length === finished.length && Math.max.apply(null, sizes) - Math.min.apply(null, sizes) > 1024) {
       caveats.push('The hosts returned different byte counts (' +
         finished.map(function (r) { return hostLabel(r.url) + ': ' + bytes(r.bytes); }).join(', ') +
         '). They are not serving the same file, so this is not a like-for-like comparison.');
+    } else if (!allProven) {
+      caveats.push('Byte counts could not be confirmed for every host, so the page cannot prove they served identical files. Check that yourself before trusting the ranking.');
     }
     var failed = results.filter(function (r) { return r.failures > 0; });
     if (failed.length) {
       caveats.push(failed.map(function (r) {
-        return hostLabel(r.url) + ' failed ' + r.failures + ' of ' + (r.failures + r.stats.n) + ' requests';
+        return hostLabel(r.url) + ' failed ' + r.failures + ' of ' + (r.failures + r.stats.n) + ' requests'
+          + (r.abandoned ? ' and was dropped after the first two' : '');
       }).join('; ') + '. Failures are excluded from the medians above.');
+    }
+    if (meta.requestedMode === 'warm' && meta.mode === 'cold') {
+      caveats.push('Repeat-visitor mode was requested but could not be used: ' + meta.blockedBy.join(' and ')
+        + ' would not permit a cross-origin read, so every host fell back to cache-busted first-visitor requests. '
+        + 'That removes the CDN advantage this test is meant to show.');
     }
     if (state.runs < 5) {
       caveats.push('Fewer than five runs per host. That is enough for a rough look and not enough to trust.');
@@ -445,9 +671,10 @@
     table.innerHTML = '';
 
     var anyDetail = results.some(function (r) { return r.detailed; });
-    $('phases-note').textContent = anyDetail
+    $('phases-note').textContent = (anyDetail
       ? 'Median of each phase. A host only reveals this breakdown if it sends a Timing-Allow-Origin header; where it does not, only the total is available.'
-      : 'None of these hosts sends a Timing-Allow-Origin header, so the browser will only tell us the totals. The breakdown below is unavailable — not zero.';
+      : 'None of these hosts sends a Timing-Allow-Origin header, so the browser will only tell us the totals. The breakdown below is unavailable — not zero.')
+      + ' Sizes marked as measured were counted from the response body, so they prove the hosts served the same file.';
 
     var head = el('thead');
     var headRow = el('tr');
@@ -713,6 +940,23 @@
     updatePayloadHint();
   }
 
+  function renderModes() {
+    var select = $('mode');
+    select.innerHTML = '';
+    MODES.forEach(function (m) {
+      var option = el('option', null, m.label);
+      option.value = m.id;
+      select.appendChild(option);
+    });
+    select.value = state.mode;
+    updateModeHint();
+  }
+
+  function updateModeHint() {
+    var m = MODES.filter(function (x) { return x.id === state.mode; })[0];
+    $('mode-hint').textContent = m ? m.hint : '';
+  }
+
   function updatePayloadHint() {
     var payload = PAYLOADS.filter(function (p) { return p.file === state.payload; })[0];
     $('payload-hint').textContent = payload ? payload.hint : '';
@@ -729,6 +973,7 @@
   restore();
   renderHosts();
   renderPayloads();
+  renderModes();
   $('runs').value = state.runs;
   $('warmup').checked = state.warmup;
 
@@ -736,6 +981,12 @@
     state.payload = this.value;
     updatePayloadHint();
     renderHosts();
+    save();
+  });
+
+  $('mode').addEventListener('change', function () {
+    state.mode = this.value;
+    updateModeHint();
     save();
   });
 
@@ -762,8 +1013,10 @@
     state.payload = PAYLOADS[1].file;
     state.runs = 8;
     state.warmup = true;
+    state.mode = 'warm';
     renderHosts();
     renderPayloads();
+    renderModes();
     $('runs').value = state.runs;
     $('warmup').checked = state.warmup;
     $('results').hidden = true;
